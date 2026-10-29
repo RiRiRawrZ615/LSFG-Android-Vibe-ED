@@ -1,0 +1,107 @@
+# LSFG-Fork Findings
+Discoveries from reference repo investigation. For future agents.
+
+## 1. Reference repos
+- `LSFG-Android-main/`: FrankBarretta's app (the one being replaced). Submodules EMPTY (not checked out):
+  - `lsfg-vk-android` = lsfg-vk 1.0.0 branch with Android patches (AHardwareBuffer image sharing, createContextFromAHB, waitIdle; all under #ifdef __ANDROID__)
+  - `LSFG-Android-Application` = Kotlin/Compose app (JNI render loop, capture engines, overlay, shell bridge)
+  - Repo README gives full feature list and architecture (see section 7 for capture modes).
+- `lsfg_vk_source/` == `lsfg-vk-upstream/` (identical content, commit 21fbd1b "fix: Introduce a fallback memory type for host visible memory"):
+  - Modules: lsfg-vk-helper, lsfg-vk-pipeline (the core), lsfg-vk-layer (Linux implicit layer), lsfg-vk-cli, lsfg-vk-config, lsfg-vk-ui (Qt).
+  - `thirdparty/vk` is a SINGLE FILE (vulkan_hpp include shim, defines VULKAN_HPP_DISPATCH_LOADER_DYNAMIC + includes vulkan headers from thirdparty/vulkan/).
+  - Pipeline depends on: vulkan-hpp (thirdparty/vulkan, 37 files incl. vk.hpp), vkhelper (lsfg-vk-helper/src/vkhelper.cpp 633 lines), shaders/Mipmaps.h (1747 lines precompiled SPIR-V), shaders/Mipmaps.hlsl (source, 252 lines).
+  - Build needs clang for -fconstexpr-steps (v3_1 signature is consteval). NDK clang is fine.
+- `eden-upstream/`: modern lsfg reference for emulators. Key files:
+  - src/video_core/frame_gen/lossless_dll.{cpp,h} (DLL parsing)
+  - src/video_core/frame_gen/lsfg_translate.{cpp,h} (D3D bytecode -> SPIR-V translation)
+  - src/video_core/renderer_vulkan/present/frame_gen*.cpp + lsfg_alpha/beta/chain/common
+  - FrameGenPacer struct: FrameGenPlan {frame_time, num_frames, ...} pacing model.
+- `Android-Native-Root-Detector-main/`: UI source for new look (Kotlin, Compose, Material3 + materialkolor dynamic colors). Key components copied/adapted:
+  - ui/theme/Theme.kt (rememberDynamicColorScheme with seed color, isDark, isAmoled)
+  - ui/component/SettingItem.kt (SettingItem, SettingNormalItem, SettingSwitchItem, SettingSubtitleItem)
+  - ui/component/CardItem.kt, Buttons.kt
+  - data store pattern: AppSettingsDataStore (datastore preferences + kotlinx.serialization)
+  - Versions: AGP 8.8.0, Kotlin 2.1.10, Compose BOM 2025.01.01, minSdk 27, targetSdk 35.
+- `scrcpy/`: server/src/main/java/com/genymobile/scrcpy/video/ScreenCapture.java is the reference for VirtualDisplay-based capture (DisplayManager.createVirtualDisplay(name, w, h, displayId, flags, surface, opts, listener)). Also NewDisplayCapture.java for newer APIs.
+- `shizuku/`: api/common/starter modules (api submodule EMPTY in ref). Use Maven: dev.rikka.shizuku:api (jitpack). ScreenCapture API: rikka.shizuku.api.ScreenCapture (bindService then createScreenCaptureSession, capture() -> ScreenCaptureBuffer, Surface.createSurfaceTexture / AHardwareBuffer). ShizukuApi.start/aidl binding.
+
+## 2. lsfg-vk pipeline core (v3_1 = LSFG_3_1P)
+- Signature is built consteval at compile time (PipelineSignatureBuilder) from passes; stage ordering + memory lifetimes computed at compile time.
+- Passes: mipmaps (pre-pass), alpha0-3 x7 scales, beta0-4, [split], gamma0-4, delta0-4 (i>=4), epsilon0-4 (i>=4), generate.
+- Push constants: {specialFlag, subiteration} (8 bytes) used to index array textures (Aggregate shader) and special first-frame paths.
+- UniformBuffer: {float timestamp; uint32_t iteration; uint32_t transferFunction; uint32_t colorSpace; float resolutionInvScale; float uiThreshold;} (24 bytes). timestamp = (index+1)/(total+1) updated per generated frame via updateBuffer in a per-frame "trans" cmdbuf (cached per index when total>8).
+- Descriptor set: binding 0 = uniform buffer; 1-3 = samplers (clamp border black/white, clamp edge); 4+ = sampled/storage image bindings per shader output group.
+- Two external images:
+  - source: RGBA8888 array (hbd: A2B10G10R10, RGBA16) count=2, ExternalInput (user writes layer iteration%2)
+  - destination: RGBA8888 (hbd variant) count=1, ExternalOutput
+- Context API (public C API of pipeline): dispatch(total) -> pre-pass; acquire() per frame -> trans+main; idle().
+  - Sync: timeline semaphores. dispatch signals internal; acquire waits sync (user-provided value) or internal, signals sync.value++.
+- Performance mode: halves flipflop counts (mul=1 vs 2) for alpha/beta/gamma/delta/epsilon intermediates.
+- flowScale: mipmap pyramid built at flow-scaled extent (extentOp {true,63,6} etc). Flow scale 1.0 = full res.
+
+## 3. DLL shader extraction
+- parseDll: PE32+ parse -> RT_RCDATA resources by id. Both Lossless.dll and lsfg-vk.dll are PE32+.
+- OLD Lossless.dll ids: 1=generate, 2147488584(0x80000008)=mipmaps(named), 3-7=gamma0-4, 8-12=delta0-4, 13-16=alpha0-3, 17-21=epsilon0-4, 22-26=beta0-4, 27-31=delta5-9(old naming), 61=generate perf variant, 131=generate perf variant2, 3436=generate perf variant3. Quality shaders = id, performance = id+24. Half precision = id+48 (quality) / id+72? (perf) per library.cpp: rid={idx+(halfPrecision?48:0), idx+(halfPrecision?48:0)+24}.
+- NEW lsfg-vk.dll ids (small): 1=generate, 2=mipmaps?, 3-7 gamma, 8-12 delta, 13-16 alpha, 17-21 epsilon, 22-26 beta; perf = +24; mipmaps named "Mipmaps" id 0x80001348? (work log: mipmaps = ID 4936 named 0x80001348).
+- library.cpp: BASE_LIBRARY = {mipmaps:0 -> rid 2147488584, generate:1}; LIBRARY = the 24 non-base (idx as above).
+- generate shader is byte-patched at load time to 3 variants (generate0/1/2) by inserting SPIR-V OpConstant 0x00000031,0x00020011 and rewriting the special constant at word offset (word&0xFFFF)==25: values 0x04 (2x), 0x0B (3x), 0x02 (1x). This encodes the "special flag" for the final generate pass.
+- mipmaps shader is REPLACED at load time with the bundled precompiled Mipmaps.h SPIR-V (HDR version). So only generate+24 shaders come from DLL.
+- All shaders are compute "main".
+
+## 4. Android architecture (from LSFG-Android-main README + work log)
+- Framegen runs on its OWN Vulkan instance/device (compute-only), separate from capture + overlay.
+- Capture -> AHardwareBuffer (RGBA8888) -> imported into framegen source image (2 layers, iteration%2).
+- Generated frame in destination AHardwareBuffer -> presented into overlay window (Vulkan WSI surface OR CPU blit fallback to ImageReader).
+- 3 capture modes:
+  1. MediaProjection (rootless): VirtualDisplay + ImageReader -> AHardwareBuffer. Requires consent dialog per session.
+  2. Shizuku: ScreenCapture API (privileged, shell uid 2000), AHardwareBuffer direct.
+  3. Root: same as Shizuku path but uid 0 via shell/root service.
+- Overlay: SYSTEM_ALERT_WINDOW or TYPE_ACCESSIBILITY_OVERLAY; touch passthrough via accessibility dispatchGesture or shell `input` re-injection; empty touchable region.
+- Game launch: `monkey -p <pkg> -c android.intent.category.LAUNCHER 1` primary (scrcpy style), fallbacks: `am start` intent patterns.
+- Foreground detection: `dumpsys activity activities` / top-activities / ActivityManager.getRunningTasks fallbacks.
+- Previous build env (from work log): JDK 21 at ~/jdk-21.0.13+9, SDK ~/Android/Sdk (android-35, build-tools 35, NDK 27.0.12077973, cmake 3.22.1), Kotlin 2.1.0, minSdk 29 (Android 10), targetSdk 35.
+- ABI: arm64-v8a (production), x86_64 (emulator).
+
+## 5. Current build env on this machine (verified)
+- java 25 system; ~/jdk17 (Temurin 17); ~/jdk-21.0.13+9 (Temurin 21)
+- Android SDK at ~/Android/Sdk: platforms android-35; build-tools 34.0.0+35.0.0; ndk 27.0.12077973; cmake 3.22.1
+- Gradle 8.9 distribution cached (~/.gradle/wrapper/dists/gradle-8.9-bin); 2.3GB gradle cache (deps pre-cached)
+- Network available (services.gradle.org reachable)
+
+## 6. Design decisions for LSFG-Fork
+- Fresh Gradle project, single :app module. Kotlin + Compose (Material3 + materialkolor) UI.
+- C++ core = port of lsfg-vk-pipeline (v3_1 signature + pipeline + library + dll parser + vkhelper) under app/src/main/cpp/framegen/ with Vulkan-Headers from NDK (vulkan vulkan.h via NDK) + volk for WSI (vkCreateAndroidSurfaceKHR) in the WSI app library.
+- Two native libs:
+  - liblsfg_framegen.so: the compute pipeline (no Android deps beyond log). JNI entry: createInstance/destroy/createContextFromAHB (import AHardwareBuffer as source/dest images)/dispatch/acquire/idle.
+  - liblsfg_wsi.so: overlay rendering: create Android surface, swapchain, blit/copy generated frame to swapchain, present.
+- Kotlin side: CaptureEngine (MediaProjection/Shizuku/Root) -> AHardwareBuffer (via ImageReader/ScreenCaptureBuffer) -> JNI -> framegen -> dest AHB -> WSI render thread presents.
+- Pacing: simple vsync-aligned loop in native WSI thread; target fps cap; multiplier frames per capture frame.
+- UI: new Material You design (cyan accent fallback scheme), screens: Home (big start button, capture mode picker, multiplier, flow, perf mode, bypass), Settings (datastore), About. In-session: floating HUD overlay with FPS + stop.
+
+## 7. Key APIs / pitfalls
+- AHardwareBuffer Vulkan import: vkGetAndroidHardwareBufferPropertiesANDROID / vkImportAndroidHardwareBufferImageANDROID. Source image created as EXTERNAL memory type, 2 layers, with VK_IMAGE_USAGE_STORAGE|TRANSFER_DST; dest similar with TRANSFER_SRC.
+- ImageReader with AHardwareBuffer: ImageReader.newInstance(w,h,FORMAT_RGBA_8888, maxImages) then acquireNextImage().getCroppedImage()... For Vulkan import, use Image.Plane / AHardwareBuffer via image.getHardwareBuffer() (API 29+).
+- Timeline semaphores need VK_KHR_timeline_semaphore (Vulkan 1.2 on all Android GPUs, minSdk 29 OK).
+- Synchronization2 (vkCmdPipelineBarrier2) is Vulkan 1.3! Android Vulkan is 1.3 on most devices (API 29+). Fallback: use classic barrier if not available. (Work log used barrier2 without issue; keep sync2 but guard.)
+- MediaProjection: VirtualDisplay listener for stop; flags = VIRTUAL_DISPLAY_FLAG_AUTOGENERATED | PUBLIC | (API 33+ PRESERVED).
+- Shizuku ScreenCapture: createScreenCaptureSession(physicalDisplayId, ...) then session.createScreenCaptureBuffer(width, height, ...) -> ScreenCaptureBuffer; buffer.capture() -> AHardwareBuffer. Must call in Shizuku binder context (main thread hop per work log Bug A).
+- Overlay window: WindowManager.LayoutParams TYPE_APPLICATION_OVERLAY, format TRANSLUCENT, flags NOT_FOCUSABLE|NOT_TOUCHABLE (touch pass) or keep touchable for HUD; SurfaceControl / hardware accelerated = Surface.fromHardwareBuffer not needed; use SurfaceTextureHost? No: standard SurfaceView or TextureView won't work for overlay; use WindowManager + Surface(SurfaceView) or ANativeWindow from Surface of a SurfaceView inside overlay. Simplest robust: overlay hosts a SurfaceView (Vulkan swapchain on its surface).
+- SurfaceView in overlay: works with TYPE_APPLICATION_OVERLAY + hardware layer.
+- Compose for main UI; overlay HUD can be Compose in second activity (transparent) or native text in swapchain. Keep Compose overlay for consistency.
+
+## 8. File inventory of what to port (lsfg_vk_source)
+- lsfg-vk-helper/src/vkhelper.cpp + include (633 lines) -> adapt paths for Android cache dir (java passes dir)
+- lsfg-vk-pipeline/src/{library.cpp, dll.cpp, v3_1.cpp, pipeline.cpp, lsfgvk.cpp} + headers + signature/* -> port
+- shaders/Mipmaps.h -> copy verbatim (1747 lines)
+- thirdparty/vk (893 byte shim) + thirdparty/vulkan (37 files) -> copy into cpp/thirdparty/
+
+## 9. Session 2 notes (implementation)
+- Source external image in pipeline is a 2-LAYER internal image (layer = iteration%2). AHB imports are 1-layer.
+  => Design: pipeline input stays internal 2-layer; capture AHB is imported separately in the framegen device
+     and BLIT into the correct input layer each write (pre-recorded blit cmdbufs, submitAndWait).
+  => Pipeline external OUTPUT = the dst AHB imported directly (zero-copy; WSI imports same AHB in its own device).
+- Pipeline descriptor check: input sampled binding = 2 imageInfos (layers 0,1), output storage binding = 1 (layer 0). Descriptor pool sizes are computed from signature; OK.
+- lsfgvk public API accessors added: Instance::_impl(), Context::pipeline() for the JNI bridge (borrow dld/device/queue/qfi).
+- WSI plan: own VkInstance (VK_KHR_surface + VK_KHR_android_surface + VK_KHR_swapchain), graphics+present queue,
+  swapchain on ANativeWindow (Surface) passed from Java, import dst AHB, blit to swapchain image, present.
+  VSync pacing via acquireNextImage timeout.

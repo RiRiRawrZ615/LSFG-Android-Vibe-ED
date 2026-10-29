@@ -1,0 +1,43 @@
+# LSFG-Fork Work Log
+# Goal: Reimplement LSFG-VK for Android entirely. New UI. Working APK output.
+# Location: /home/amd/Documents/AI_Output/Forks/LSFG-Fork
+
+## Task Layout
+1. [DONE] Survey reference repos
+2. [DONE] Write Findings.txt with architectural discoveries
+3. [DONE] Design LSFG-Fork project structure (Gradle + CMake + Kotlin/Compose + C++ core)
+4. [DONE] Implement C++ Vulkan core (shader loader, framegen pipeline, render loop, WSI)
+5. [DONE] Implement Android capture engines (Root/KernelSU preferred, passthrough first)
+6. [DONE] Implement new UI (Compose, Material You)
+7. [DONE] Implement session shell bridge (game launch, touch passthrough, foreground detection)
+8. [DONE] Build with Gradle/CMake (arm64-v8a + x86_64), verify APK
+9. [DONE] Finalize work.log
+
+## Progress
+- 2026-10-28: Started fresh session (previous agent reset; work log in RefSourceCode/lsfg_work.txt read and archived as reference).
+- [DONE] Task 2: Findings.txt written (DLL formats, pipeline internals, capture modes, build env, design).
+- [DONE] Task 3: Project structure created. Pipeline core ported + adapted:
+  - framegen/: library.cpp, dll.cpp, v3_1.cpp, pipeline.cpp, lsfgvk.cpp, vkhelper.cpp + headers, shaders/Mipmaps.h, thirdparty/vulkan + vk shim
+  - AHB import support added (vkhelper::createImageFromAhb, Pipeline ahbInput/ahbOutput, Context passes through)
+  - Dual-format DLL loader (old Lossless.dll IDs + new lsfg-vk.dll small IDs, named mipmaps resolution)
+  - lsfg_jni.cpp: FramegenBridge (nativeInit/CreateSession/WriteSource/Dispatch/Acquire/Idle/Destroy)
+  - lsfg_display.{h,cpp}: frame queue between framegen and WSI presenter
+- [DONE] Task 4: WSI presenter (swapchain + AHB import + present loop)
+- [DONE] Task 5: Root capture engine (screencap via libsu root shell, PNG decode -> HardwareBuffer -> WSI queue)
+- [DONE] Task 6: Compose UI (Material You theme, HomeScreen with Start/Stop, package picker, multiplier, flow scale, performance mode, root status)
+- [DONE] Task 7: Shell bridge (monkey launch, dumpsys foreground detection)
+- [DONE] Task 8: First successful APK build (arm64-v8a + x86_64, ~17MB debug APK)
+
+## Build Log
+- 2026-10-28 22:09: Started build session
+- 2026-10-28 23:50: First successful build (BUILD SUCCESSFUL in 8s, 26 actionable tasks)
+- APK: app/build/outputs/apk/debug/app-debug.apk (17M)
+- ABIs: arm64-v8a, x86_64
+
+## Known TODOs
+- Test on device (root screencap + overlay presentation)
+- Wire framegen pipeline (currently passthrough mode)
+- Add Shizuku capture path
+- Add MediaProjection fallback
+- Polish Material You UI
+- Optimize capture (raw RGBA screencap, zero-copy AHB)

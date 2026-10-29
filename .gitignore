@@ -1,0 +1,22 @@
+# --- Gradle ---
+.gradle/
+build/
+!gradle/wrapper/gradle-wrapper.jar
+
+# --- Local machine config (never commit) ---
+local.properties
+
+# --- CMake / NDK native build output ---
+.cxx/
+app/.cxx/
+externalNativeBuild/
+
+# --- Kotlin / IDE ---
+.kotlin/
+.idea/
+*.iml
+captures/
+
+# --- OS noise ---
+.DS_Store
+Thumbs.db

@@ -1,0 +1,13 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <style name="Theme.LSFG" parent="android:Theme.Material.NoActionBar">
+        <item name="android:windowBackground">@color/lsfg_bg</item>
+    </style>
+    <style name="Theme.LSFG.Transparent" parent="android:Theme.Material.NoActionBar">
+        <item name="android:windowBackground">@android:color/transparent</item>
+        <item name="android:windowNoTitle">true</item>
+        <item name="android:windowIsTranslucent">true</item>
+    </style>
+    <color name="lsfg_bg">#0B0F14</color>
+    <color name="lsfg_accent">#22D3EE</color>
+</resources>

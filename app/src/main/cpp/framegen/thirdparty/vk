@@ -1,0 +1,20 @@
+/* SPDX-License-Identifier: CC-BY-NC-ND-4.0 */
+/* vk shim for the LSFG-Fork framegen core (adapted from lsfg-vk thirdparty/vk) */
+
+#pragma once
+
+#define VULKAN_HPP_DISPATCH_LOADER_DYNAMIC 1
+#define VULKAN_HPP_TYPESAFE_CONVERSION 0
+#define VULKAN_HPP_NO_DEFAULT_DISPATCHER 1
+#define VULKAN_HPP_NO_CONSTRUCTORS 1
+#define VULKAN_HPP_NO_SETTERS 1
+#define VULKAN_HPP_NO_SPACESHIP_OPERATOR 1
+#define VULKAN_HPP_NO_TO_STRING 1
+
+#include <vulkan/vulkan.hpp>
+#include <vulkan/vulkan_enums.hpp>
+#include <vulkan/vulkan_format_traits.hpp>
+#include <vulkan/vulkan_funcs.hpp>
+#include <vulkan/vulkan_handles.hpp>
+#include <vulkan/vulkan_structs.hpp>
+#include <vulkan/vulkan_core.h>

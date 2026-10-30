@@ -15,7 +15,17 @@
 - Captures the screen of a running (game) app on an Android device.
 - Feeds frames into a native Vulkan **compute pipeline** (LSFG `v3_1` / `LSFG_3_1P` signature) that generates extra interpolated frames and upscales the result.
 - Presents the generated frames to an **overlay window** via a Vulkan WSI swapchain (vsync-paced).
-- Drives everything through a fresh **Material You** UI: capture-mode picker, frame multiplier, flow scale, performance mode, session start/stop, root status.
+- Drives everything through a fresh **Material You** UI + a **sticky foreground-service notification** (start/stop, multiplier, capture mode) you can control while in-game.
+
+### Capture modes (implemented)
+1. **Non-root** — MediaProjection + VirtualDisplay + ImageReader (scrcpy-style). One-time system consent.
+2. **Shizuku** — privileged shell `screencap`.
+3. **Root** — root shell `screencap` (KernelSU / Magisk). Highest performance.
+
+### Overlay
+- The presenter surface is hosted as a **`TYPE_APPLICATION_OVERLAY` window** owned by the
+  foreground service (not a translucent activity), so it stays above the target app on
+  MIUI/Xiaomi and never steals input (`FLAG_NOT_TOUCHABLE`).
 
 ### Two native libraries
 | Library | Responsibility |
@@ -23,21 +33,17 @@
 | `liblsfg_framegen.so` | The Vulkan compute pipeline: shader loader (from `lsfg-vk.dll`), `v3_1` signature (built `consteval` at compile time), `dispatch`/`acquire`/`idle` frame loop, and `AHardwareBuffer` import (source/dest images). |
 | `liblsfg_wsi.so` | Overlay rendering: Android surface + swapchain, blit of generated frames to the swapchain image, vsync-paced present. |
 
-### Capture modes (planned / in progress)
-1. **MediaProjection** (rootless, per-session consent dialog) — *TODO*
-2. **Shizuku** (privileged shell, `ScreenCapture` API) — *TODO*
-3. **Root** (root shell `screencap` → decode → `AHardwareBuffer`) — *basic path implemented*
-
 ---
 
-## Status / known TODOs
+## Status
 - ✅ Builds to a debug APK (`arm64-v8a` + `x86_64`)
-- ⏳ On-device testing (capture + overlay presentation)
-- ⏳ Framegen pipeline currently in **passthrough** mode; full `v3_1` generation not yet wired end-to-end
-- ⏳ Shizuku capture path
-- ⏳ MediaProjection (rootless) fallback
-- ⏳ UI polish (Material You)
-- ⏳ Capture optimization (raw RGBA, zero-copy `AHardwareBuffer`)
+- ✅ **Framegen pipeline wired end-to-end** (LSFG `v3_1`), ON by default, with transparent passthrough fallback
+- ✅ **Foreground service + sticky control notification** (start/stop, multiplier, capture mode, live status)
+- ✅ **MIUI-safe visual-only overlay** (`TYPE_APPLICATION_OVERLAY`, non-touchable)
+- ✅ **Three capture modes**: non-root (MediaProjection), Shizuku, root (screencap)
+- ✅ **User-supplied shader DLL** picker (Lossless.dll / lsfg-vk.dll) + bundled fallback
+- ✅ **App icon** rebuilt (adaptive + exact-size legacy, art in the safe zone)
+- ⏳ On-device tuning: per-GPU MediaProjection frame rate, `screencap` latency, min-interval pacing
 
 ## Build
 Requires the Android SDK (platform `35`, build-tools `35`, NDK `27.0.12077973`, CMake `3.22.1`) and JDK 21.
@@ -68,14 +74,18 @@ app/
     │   ├── lsfg_display.{h,cpp}         # frame queue: framegen -> wsi
     │   └── wsi/                         # volk + Android surface presenter
     ├── kotlin/com/lsfg/fork/            # Compose app + native bridges
-    │   ├── LSFGApp.kt / MainActivity.kt / OverlayActivity.kt
-    │   ├── capture/CaptureEngine.kt
+    │   ├── LSFGApp.kt / MainActivity.kt
+    │   ├── CaptureService.kt             # FGS + sticky control notification
+    │   ├── DllStore.kt                   # user shader DLL (SAF) management
+    │   ├── SessionManager.kt             # orchestrator (framegen + capture + wsi)
+    │   ├── RootChecker.kt / ShellBridge.kt
+    │   ├── capture/CaptureEngine.kt      # nonroot / shizuku / root capture + AHB ring
+    │   ├── overlay/OverlayController.kt  # TYPE_APPLICATION_OVERLAY surface host
     │   ├── framegen/FramegenBridge.kt
     │   ├── wsi/WsiBridge.kt
-    │   ├── ShellBridge.kt / SessionManager.kt / RootChecker.kt
     │   └── ui/HomeScreen.kt / Theme.kt
-    └── res/                             # Material theme + launcher icon
-LSFG_Progress/                           # research findings + work log (for future agents)
+    └── res/                             # Material theme + adaptive launcher icon
+../PortLogs/                             # work log + plan (for future agents)
 ```
 
 ## Attribution & upstream

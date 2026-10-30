@@ -1,7 +1,11 @@
 package com.lsfg.fork
 
+import android.Manifest
+import android.app.Activity
 import android.content.Context
 import android.content.Intent
+import android.content.pm.PackageManager
+import android.net.Uri
 import android.os.Build
 import android.os.Bundle
 import android.provider.Settings
@@ -9,6 +13,8 @@ import android.util.Log
 import android.widget.Toast
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Surface
@@ -22,7 +28,7 @@ class MainActivity : ComponentActivity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-        Log.i(TAG, "MainActivity onCreate, session running=" + session.isRunning())
+        Log.i(SessionManager.TAG, "MainActivity onCreate, running=" + session.isRunning())
 
         setContent {
             LSFGTheme {
@@ -31,62 +37,167 @@ class MainActivity : ComponentActivity() {
                     color = MaterialTheme.colorScheme.background
                 ) {
                     HomeScreen(
-                        onStart = { startSession() },
-                        onStop = { stopSession() }
+                        onStart = { startFlow() },
+                        onStop = { stopFlow() },
+                        onPickDll = { pickDll() },
+                        onResetDll = { resetDll() }
                     )
                 }
             }
         }
     }
 
-    private fun startSession() {
+    // ---------- start / stop ----------
+
+    private fun startFlow() {
         val s = session.state.value
-        val pkg = s.targetPkg
 
         if (session.isRunning()) {
-            Toast.makeText(this, "Session already running", Toast.LENGTH_SHORT).show()
+            toast("Session already running")
             return
         }
 
-        val overlayOk = if (Build.VERSION.SDK_INT >= 23)
-            Settings.canDrawOverlays(this)
-        else true
-        if (!overlayOk) {
-            Toast.makeText(this, "Grant overlay permission first (system UI settings)", Toast.LENGTH_LONG).show()
+        // 1) Notification permission (Android 13+) - required for the sticky control UI.
+        if (Build.VERSION.SDK_INT >= 33) {
+            val granted = checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS)
+            if (granted != PackageManager.PERMISSION_GRANTED) {
+                notifiPermissionLauncher.launch(Manifest.permission.POST_NOTIFICATIONS)
+                // continue anyway; the app still works, the notification may be blocked by the user
+            }
+        }
+
+        // 2) Overlay permission (draw over other apps) - required for the visual overlay.
+        if (Build.VERSION.SDK_INT >= 23 && !Settings.canDrawOverlays(this)) {
+            toast("Grant 'display over other apps' to continue")
             try {
                 startActivity(
-                    Intent(android.provider.Settings.ACTION_MANAGE_OVERLAY_PERMISSION)
+                    Intent(Settings.ACTION_MANAGE_OVERLAY_PERMISSION)
                         .apply { addFlags(Intent.FLAG_ACTIVITY_NEW_TASK) }
                 )
             } catch (_: Throwable) {}
             return
         }
 
-        if (pkg != null) {
-            val launched = ShellBridge.launch(pkg)
-            Log.i(TAG, "launch $pkg -> $launched")
+        // 3) Nonroot mode needs MediaProjection consent (system dialog, per session).
+        if (s.captureMode == "nonroot" && SessionManager.pendingProjectionData == null) {
+            toast("Please allow screen capture (one-time consent)")
+            requestProjectionConsent()
+            return
         }
 
-        // Delay so the target app reaches the foreground, then open the overlay.
-        window.decorView.postDelayed({
+        // 4) Launch the target app (if selected), then start the service session.
+        val pkg = s.targetPkg
+        if (pkg != null) {
             try {
-                startActivity(
-                    Intent(this, OverlayActivity::class.java)
-                        .apply { addFlags(Intent.FLAG_ACTIVITY_NEW_TASK) }
-                )
-            } catch (t: Throwable) {
-                Log.e(TAG, "start overlay failed", t)
-                Toast.makeText(this, "Overlay failed: " + t.message, Toast.LENGTH_LONG).show()
+                val li = packageManager.getLaunchIntentForPackage(pkg)
+                if (li != null) startActivity(li) else ShellBridge.launch(pkg)
+            } catch (_: Throwable) {
+                ShellBridge.launch(pkg)
             }
-        }, 350)
+        }
+
+        val dllPath = DllStore.userDllPath(applicationContext)
+        window.decorView.postDelayed({
+            startServiceIntent(CaptureService.ACTION_START, dllPath)
+            toast("LSFG starting...")
+        }, if (pkg != null) 500L else 50L)
     }
 
-    private fun stopSession() {
-        session.endSession()
-        Toast.makeText(this, "Session stopped", Toast.LENGTH_SHORT).show()
+    private fun stopFlow() {
+        startServiceIntent(CaptureService.ACTION_STOP, null)
+        toast("Stopping session...")
     }
 
-    companion object {
-        const val TAG = "lsfg-fork"
+    private fun startServiceIntent(action: String, dllPath: String?) {
+        try {
+            val i = Intent(this, CaptureService::class.java).setAction(action)
+            if (dllPath != null) i.putExtra(CaptureService.EXTRA_DLL, dllPath)
+            if (Build.VERSION.SDK_INT >= 26) startForegroundService(i) else startService(i)
+        } catch (t: Throwable) {
+            Log.e(SessionManager.TAG, "startService", t)
+            toast("Service start failed: ${t.message}")
+        }
     }
+
+    // ---------- MediaProjection consent ----------
+
+    private fun requestProjectionConsent() {
+        try {
+            val mpm = getSystemService(Context.MEDIA_PROJECTION_SERVICE) as android.media.projection.MediaProjectionManager
+            val intent = mpm.createScreenCaptureIntent()
+            projectionLauncher.launch(intent)
+        } catch (t: Throwable) {
+            Log.e(SessionManager.TAG, "projection consent", t)
+            toast("MediaProjection unavailable: " + t.message)
+        }
+    }
+
+    // ---------- user DLL picker ----------
+
+    private fun pickDll() {
+        try {
+            val i = Intent(Intent.ACTION_OPEN_DOCUMENT).apply {
+                addCategory(Intent.CATEGORY_OPENABLE)
+                type = "*/*"
+                putExtra(Intent.EXTRA_MIME_TYPES, arrayOf("*/*"))
+            }
+            dllLauncher.launch(i)
+        } catch (t: Throwable) {
+            toast("File picker failed: " + t.message)
+        }
+    }
+
+    private fun resetDll() {
+        DllStore.clear(applicationContext)
+        toast("Using bundled lsfg-vk.dll")
+    }
+
+    private fun copyUserDll(uri: Uri) {
+        try {
+            val target = DllStore.userDllFile(applicationContext)
+            contentResolver.openInputStream(uri).use { input ->
+                if (input == null) { toast("Cannot read file"); return }
+                target.outputStream().use { output -> input.copyTo(output) }
+            }
+            DllStore.setActive(applicationContext)
+            toast("Shader DLL loaded: ${target.name} (${target.length()} bytes)")
+        } catch (t: Throwable) {
+            Log.e(SessionManager.TAG, "copyUserDll", t)
+            toast("DLL copy failed: " + t.message)
+        }
+    }
+
+    // ---------- result launchers ----------
+
+    private val notifiPermissionLauncher =
+        registerForActivityResult(ActivityResultContracts.RequestPermission()) { }
+
+    private val projectionLauncher =
+        registerForActivityResult(ActivityResultContracts.StartActivityForResult()) { result ->
+            if (result.resultCode == Activity.RESULT_OK) {
+                val data = result.data
+                if (data != null) {
+                    SessionManager.pendingProjectionData = data
+                    toast("Screen capture consented. Starting...")
+                    window.decorView.postDelayed({
+                        startServiceIntent(CaptureService.ACTION_START, DllStore.userDllPath(applicationContext))
+                    }, 200L)
+                }
+            } else {
+                toast("Screen capture denied - use Root mode or re-try")
+            }
+        }
+
+    private val dllLauncher =
+        registerForActivityResult(ActivityResultContracts.StartActivityForResult()) { result ->
+            if (result.resultCode == Activity.RESULT_OK) {
+                val uri = result.data?.data
+                if (uri != null) copyUserDll(uri)
+            }
+        }
+
+    private fun toast(msg: String) {
+        Toast.makeText(this, msg, Toast.LENGTH_SHORT).show()
+    }
+
 }

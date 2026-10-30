@@ -16,6 +16,7 @@
 #include <atomic>
 #include <chrono>
 #include <cstdint>
+#include <cstring>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -487,6 +488,43 @@ JNIEXPORT void JNICALL
 Java_com_lsfg_fork_wsi_WsiBridge_nativePushFrame(JNIEnv*, jclass, jlong ahbPtr) {
     if (ahbPtr)
         lsfgdisplay::push(static_cast<uintptr_t>(ahbPtr));
+}
+
+JNIEXPORT jint JNICALL
+Java_com_lsfg_fork_wsi_WsiBridge_nativeQueueSize(JNIEnv*, jclass) {
+    return lsfgdisplay::size();
+}
+
+/**
+ * Fast CPU fill of a HardwareBuffer ring slot from a raw RGBA8888 byte source
+ * (e.g. an ImageReader RGBA_8888 plane from a MediaProjection VirtualDisplay).
+ * Copies row by row, respecting the source row stride.
+ */
+JNIEXPORT void JNICALL
+Java_com_lsfg_fork_wsi_WsiBridge_nativeFillAhb(
+        JNIEnv* env, jclass, jobject ahbObj, jbyteArray bytes, jint srcRowStride) {
+    if (!ahbObj || !bytes || srcRowStride <= 0) return;
+    AHardwareBuffer* ahb = AHardwareBuffer_fromHardwareBuffer(env, ahbObj);
+    if (!ahb) return;
+    AHardwareBuffer_Desc desc{};
+    AHardwareBuffer_describe(ahb, &desc);
+    if (desc.width == 0 || desc.height == 0) return;
+    void* data = nullptr;
+    AHardwareBuffer_lock(ahb, AHARDWAREBUFFER_USAGE_CPU_WRITE_RARELY,
+                         /*fence*/ 0, /*rect*/ nullptr, &data);
+    if (!data) return;
+    uint8_t* src = static_cast<uint8_t*>(env->GetPrimitiveArrayCritical(bytes, nullptr));
+    if (src) {
+        const uint32_t rowBytes = desc.width * 4; // RGBA8888 (4 bytes/pixel)
+        uint8_t* d = static_cast<uint8_t*>(data);
+        for (uint32_t y = 0; y < desc.height; ++y) {
+            std::memcpy(d + y * static_cast<size_t>(desc.stride),
+                        src + y * static_cast<size_t>(srcRowStride),
+                        rowBytes);
+        }
+        env->ReleasePrimitiveArrayCritical(bytes, src, JNI_ABORT);
+    }
+    AHardwareBuffer_unlock(ahb, nullptr);
 }
 
 JNIEXPORT jlong JNICALL

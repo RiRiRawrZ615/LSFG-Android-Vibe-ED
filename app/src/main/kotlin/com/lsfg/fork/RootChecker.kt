@@ -7,13 +7,31 @@ import com.topjohnwu.superuser.ShellUtils
 /** Root / KernelSU detection for the UI status line. */
 object RootChecker {
 
+    /** Fast synchronous check without blocking on shell init. */
+    fun detectFast(): Boolean {
+        // Check for root binaries that indicate root is available
+        val rootPaths = arrayOf("/system/bin/su", "/system/xbin/su", "/data/local/bin/su", "/data/local/xbin/su", "/sbin/su")
+        for (p in rootPaths) {
+            val f = java.io.File(p)
+            if (f.exists() && f.canExecute()) return true
+        }
+        // Check KernelSU
+        if (java.io.File("/dev/ksu").exists()) return true
+        if (java.io.File("/sbin/.magisk").exists()) return true
+        // Check uid
+        if (Process.myUid() == 0) return true
+        return false
+    }
+
     fun detect(): RootState {
-        var root: Boolean = false
+        var root = detectFast()
         var provider = "none"
         try {
             root = Shell.rootAccess()
             provider = if (root) "root" else "shell"
         } catch (_: Throwable) {
+            // If shell failed, keep fast-check result
+            provider = "none"
         }
 
         // Probe KernelSU Next: ksu binary / procfs hints.
@@ -28,7 +46,15 @@ object RootChecker {
         } catch (_: Throwable) {
         }
 
-        return RootState(root = root, provider = provider, ksuNext = ksu, uid = Process.myUid())
+        return RootState(root = root || detectFast(), provider = provider, ksuNext = ksu, uid = Process.myUid())
+    }
+
+    /** Detect Shizuku via its service socket. */
+    fun shizukuAvailable(): Boolean = try {
+        val out = ShellUtils.fastCmd("ls /data/local/tmp/shizuku 2>/dev/null | wc -l").trim()
+        out.toIntOrNull() == 1
+    } catch (_: Throwable) {
+        false
     }
 
     data class RootState(

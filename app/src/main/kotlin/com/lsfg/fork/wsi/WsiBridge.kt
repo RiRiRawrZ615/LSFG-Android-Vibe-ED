@@ -25,6 +25,16 @@ object WsiBridge {
     external fun nativeSurfaceToWindow(surface: Surface): Long
     external fun nativeReleaseWindow(windowPtr: Long)
 
+    /** Number of frames currently queued for presentation (backpressure monitor). */
+    external fun nativeQueueSize(): Int
+
+    /**
+     * Fast CPU fill of a HardwareBuffer ring slot from raw RGBA8888 bytes
+     * (e.g. an ImageReader plane from a MediaProjection VirtualDisplay).
+     * srcRowStride is in bytes and may exceed width*4 (plane padding).
+     */
+    external fun nativeFillAhb(ahb: HardwareBuffer, bytes: ByteArray, srcRowStride: Int)
+
     fun start(windowPtr: Long, width: Int, height: Int, targetFps: Float) =
         nativeStart(windowPtr, width, height, targetFps)
 
@@ -32,4 +42,20 @@ object WsiBridge {
     fun isRunning() = nativeIsRunning()
     fun setPaused(paused: Boolean) = nativeSetPaused(paused)
     fun setTargetFps(fps: Float) = nativeSetTargetFps(fps)
+
+    fun queueSize(): Int = try { nativeQueueSize() } catch (_: Throwable) { 0 }
+
+    /**
+     * Fill [ahb] (width x height RGBA8888) from [bytes] and return the native
+     * AHardwareBuffer pointer to feed framegen/presenter, or 0 on failure.
+     */
+    fun fillAhb(ahb: HardwareBuffer, bytes: ByteArray, srcRowStride: Int): Long {
+        try {
+            nativeFillAhb(ahb, bytes, srcRowStride)
+        } catch (t: Throwable) {
+            println("WsiBridge.fillAhb: $t")
+            return 0L
+        }
+        return nativeAhbPtr(ahb)
+    }
 }

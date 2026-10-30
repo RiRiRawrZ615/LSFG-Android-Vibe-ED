@@ -1,6 +1,7 @@
 package com.lsfg.fork.ui
 
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.*
 import com.lsfg.fork.SessionManager
 import com.lsfg.fork.ShellBridge
@@ -28,7 +29,9 @@ import androidx.compose.ui.unit.sp
 @Composable
 fun HomeScreen(
     onStart: () -> Unit,
-    onStop: () -> Unit
+    onStop: () -> Unit,
+    onPickDll: () -> Unit,
+    onResetDll: () -> Unit
 ) {
     val ctx = LocalContext.current
     val session = remember { SessionManager.shared }
@@ -86,7 +89,7 @@ fun HomeScreen(
                     val statusLine = buildString {
                         append("root: ${if (s.rootInfo.root) "yes" else "no"}")
                         if (s.rootInfo.ksuNext) append(" (KSU-Next)")
-                        append("  |  mode: ${s.mode}")
+                        append("  |  capture: ${s.captureMode}")
                         if (running) {
                             append("  |  ")
                             append("%.1f fps".format(s.fps))
@@ -137,8 +140,11 @@ fun HomeScreen(
                         horizontalArrangement = Arrangement.SpaceBetween,
                         verticalAlignment = Alignment.CenterVertically
                     ) {
-                        Text("Multiplier (frames per captured frame)")
-                        Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                        Text("Multiplier")
+                        Row(
+                            Modifier.horizontalScroll(rememberScrollState()),
+                            horizontalArrangement = Arrangement.spacedBy(6.dp)
+                        ) {
                             listOf(1, 2, 3, 4).forEach { m ->
                                 FilterChip(
                                     selected = multiplier == m,
@@ -181,6 +187,64 @@ fun HomeScreen(
                         Text("Bypass framegen (passthrough)")
                         Switch(checked = bypass, onCheckedChange = { bypass = it; session.setFramegenBypass(it) })
                     }
+                }
+            }
+
+            // --- Capture mode ---
+            Card(Modifier.fillMaxWidth()) {
+                Column(Modifier.padding(14.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                    Text("Capture mode", style = MaterialTheme.typography.titleMedium)
+                    Row(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalAlignment = Alignment.CenterVertically) {
+                        FilterChip(
+                            selected = s.captureMode == "root",
+                            onClick = { session.setCaptureMode("root") },
+                            label = { Text("Root") }
+                        )
+                        FilterChip(
+                            selected = s.captureMode == "shizuku",
+                            onClick = { session.setCaptureMode("shizuku") },
+                            enabled = s.rootInfo.root, // Shizuku needs at least shell access
+                            label = { Text("Shizuku") }
+                        )
+                        FilterChip(
+                            selected = s.captureMode == "nonroot",
+                            onClick = { session.setCaptureMode("nonroot") },
+                            enabled = true,
+                            label = { Text("Non-root") }
+                        )
+                    }
+                    Text(
+                        when (s.captureMode) {
+                            "root" -> "Uses root shell (screencap via su). Highest performance."
+                            "shizuku" -> "Uses Shizuku ScreenCapture API. Works without root if Shizuku is running."
+                            "nonroot" -> "Uses MediaProjection (system screen capture dialog). No root needed."
+                            else -> "Capture mode: ${s.captureMode}"
+                        },
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                }
+            }
+
+            // --- Shader DLL ---
+            Card(Modifier.fillMaxWidth()) {
+                Column(Modifier.padding(14.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                    Text("Shader DLL (framegen library)", style = MaterialTheme.typography.titleMedium)
+                    Text(
+                        if (s.framegenSource == "user") "User-supplied DLL active"
+                        else "Bundled lsfg-vk.dll",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = if (s.framegenSource == "user") Color(0xFF4ADE80) else MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                    Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                        OutlinedButton(onClick = onPickDll) { Text("Select DLL...") }
+                        OutlinedButton(onClick = onResetDll) { Text("Reset to bundled") }
+                    }
+                    Text(
+                        "Plug in your own compiled Lossless.dll or lsfg-vk.dll for custom LSFG shaders. Reset to fall back to the bundled library.",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
                 }
             }
 

@@ -157,6 +157,20 @@ class MainActivity : ComponentActivity() {
         if (s.captureMode == "nonroot" && SessionManager.pendingProjectionData == null) {
             Log.i(SessionManager.TAG, "requesting MediaProjection consent")
             toast("Allow screen capture (one-time consent), then we'll continue")
+            // CRITICAL FIX (Jan: "picker -> app stops working without capture
+            // being initiated"): the consent picker is a separate system
+            // activity that puts LSFG in the background. On Android 14/15/17 the
+            // system may kill a background app that has no active mediaProjection
+            // foreground service. So BEFORE the picker opens, start the service
+            // with the mediaProjection FGS type to keep LSFG alive while the
+            // user is in the picker and when they return.
+            try {
+                val i = Intent(this, CaptureService::class.java).setAction(CaptureService.ACTION_PREPARE)
+                if (Build.VERSION.SDK_INT >= 26) startForegroundService(i) else startService(i)
+                Log.i(SessionManager.TAG, "prepared FGS (mediaProjection) before consent picker")
+            } catch (t: Throwable) {
+                Log.w(SessionManager.TAG, "prepare FGS failed: ${t.message}")
+            }
             pendingStart = true
             requestProjectionConsent()
             return
@@ -295,9 +309,13 @@ class MainActivity : ComponentActivity() {
                 if (data != null) {
                     SessionManager.pendingProjectionData = data
                     Log.i(SessionManager.TAG, "MediaProjection consent granted")
-                    toast("Screen capture consented. Starting...")
-                    if (pendingStart) {
-                        pendingStart = false
+                    // ALWAYS resume the start flow on consent (not only when
+                    // pendingStart is set): the activity may have been recreated
+                    // while the picker was open, which would have lost the flag.
+                    // If a session is already running this is a harmless no-op.
+                    pendingStart = false
+                    if (!session.isRunning()) {
+                        toast("Screen capture consented. Starting...")
                         startFlow()
                     }
                 }

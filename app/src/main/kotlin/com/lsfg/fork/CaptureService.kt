@@ -36,6 +36,7 @@ class CaptureService : Service() {
         const val CHANNEL = "lsfg_session"
         const val NOTIF = 4242
 
+        const val ACTION_PREPARE = "com.lsfg.fork.PREPARE"
         const val ACTION_START = "com.lsfg.fork.START"
         const val ACTION_STOP = "com.lsfg.fork.STOP"
         const val ACTION_TOGGLE = "com.lsfg.fork.TOGGLE"
@@ -74,6 +75,18 @@ class CaptureService : Service() {
         userDllPath = intent?.getStringExtra(EXTRA_DLL)
 
         when (intent?.action) {
+            ACTION_PREPARE -> {
+                // CRITICAL FIX (Jan: "non-root -> picker -> app stops working"): the
+                // MediaProjection consent picker is a separate system activity that
+                // sends LSFG to the BACKGROUND the moment it opens. On Android
+                // 14/15/17 the system may kill a background app UNLESS it holds a
+                // live foreground service with the `mediaProjection` type declared.
+                // So BEFORE the picker opens we claim the mediaProjection FGS type
+                // here, keeping the process alive while the user is in the picker.
+                usingMediaProjection = true
+                startForegroundSafely(buildIdleNotification("Waiting for screen capture consent..."))
+                Log.i(TAG, "ACTION_PREPARE: holding mediaProjection FGS for the consent picker")
+            }
             ACTION_START, null -> startSession()
             ACTION_STOP -> stopSession()
             ACTION_TOGGLE -> {

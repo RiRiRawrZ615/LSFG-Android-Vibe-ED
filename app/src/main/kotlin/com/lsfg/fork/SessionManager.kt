@@ -322,10 +322,21 @@ class SessionManager : ViewModel() {
             )
             eng.mode = mode
             eng.frameSink = frameSink
+            // CRITICAL (Jan: "capture by any means possible"): if this is a
+            // non-root session but the device actually has a working root, arm
+            // the root `screencap` fallback. Then if MediaProjection ever yields
+            // no frames (consent lost / picker killed the app / getMediaProjection
+            // failed), the engine still produces frames via root. On a truly
+            // non-root device this stays off and non-root uses MediaProjection.
+            val canRoot = try { RootChecker.detect().root } catch (_: Throwable) { false }
+            if (mode == "nonroot" && canRoot) {
+                eng.rootFallback = true
+                Log.i(TAG, "beginSession: nonroot session armed with ROOT screencap fallback")
+            }
             engine = eng
             eng.start()
             mediaProjection = proj
-            Log.i(TAG, "beginSession: capture engine started (mode=$mode)")
+            Log.i(TAG, "beginSession: capture engine started (mode=$mode rootFallback=${eng.rootFallback})")
         }
 
         if (framegenSessionOk) {

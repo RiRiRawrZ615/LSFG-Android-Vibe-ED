@@ -41,7 +41,14 @@ class CaptureEngine(
      *  Return the number of frames pushed (0 => passthrough fallback). */
     @Volatile var frameSink: ((srcAhb: HardwareBuffer, srcAhbPtr: Long) -> Int)? = null,
     /** MediaProjection for nonroot mode (null for root/shizuku). */
-    private val projection: MediaProjection?
+    private val projection: MediaProjection?,
+    /**
+     * CRITICAL (Jan: "ensure capture can start by any means possible"): when a
+     * non-root session has no working MediaProjection (consent lost, picker
+     * killed the app, getMediaProjection failed) but the device is rooted, fall
+     * back to root `screencap` so capture STILL starts. Default false.
+     */
+    @Volatile var rootFallback: Boolean = false
 ) {
     @Volatile var running: Boolean = false
         private set
@@ -128,6 +135,24 @@ class CaptureEngine(
                             latencySum += System.currentTimeMillis() - t0
                             consecutiveErrors = 0
                         } else {
+                            // Capture-by-any-means: if MediaProjection produced
+                            // nothing this cycle and we have a root fallback,
+                            // use a root screencap so the session still gets frames.
+                            if (mode == "nonroot" && rootFallback) {
+                                val fb = captureRootFallback()
+                                if (fb != null) {
+                                    val ahbPtr = WsiBridge.nativeAhbPtr(fb)
+                                    val sink = frameSink
+                                    val produced = if (sink != null) {
+                                        try { sink(fb, ahbPtr) } catch (t: Throwable) { lastError = t.message; 0 }
+                                    } else 0
+                                    if (produced <= 0 && ahbPtr != 0L) WsiBridge.nativePushFrame(ahbPtr)
+                                    lastFrameSource = "root-fallback"
+                                    frames++
+                                    consecutiveErrors = 0
+                                    continue
+                                }
+                            }
                             if (mode == "nonroot") {
                                 Thread.sleep(4)
                             }
@@ -239,6 +264,22 @@ class CaptureEngine(
         } finally {
             image.close()
         }
+    }
+
+    /** Root fallback for non-root mode: same screencap->file path as root mode. */
+    private fun captureRootFallback(): HardwareBuffer? {
+        val res = Shell.cmd("screencap -p ${rootFile.absolutePath}").exec()
+        if (!res.isSuccess) {
+            Log.w("CaptureEngine", "rootFallback screencap failed (code ${res.code}): ${res.err}")
+            return null
+        }
+        val src = BitmapFactory.decodeFile(rootFile.absolutePath)
+        try { if (rootFile.exists()) rootFile.delete() } catch (_: Throwable) {}
+        if (src == null) {
+            Log.w("CaptureEngine", "rootFallback png decode failed")
+            return null
+        }
+        return fillRing(src)
     }
 
     // ---- root: screencap -> app filesDir -> direct File read (fast) ----

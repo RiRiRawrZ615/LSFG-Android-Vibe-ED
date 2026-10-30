@@ -10,7 +10,6 @@ import android.view.SurfaceView
 import android.view.WindowManager
 import com.lsfg.fork.Log
 import java.util.concurrent.CountDownLatch
-import java.util.concurrent.TimeUnit
 
 /**
  * Hosts the presentation [SurfaceView] as a system overlay window
@@ -45,9 +44,21 @@ class OverlayController(private val appContext: Context) {
 
     private val dm = DisplayMetrics()
 
+    /**
+     * VISIBLE display size, i.e. the area *below the status bar*.
+     *
+     * CRITICAL FIX (Ante0: "the menu appears under my status bar so I can't tap
+     * anything there"): the old code used getRealMetrics(), which returns the
+     * FULL panel INCLUDING the status bar, and paired it with
+     * FLAG_LAYOUT_IN_SCREEN. Together they made the overlay cover the status
+     * bar and pushed the top row of the UI (tabs) underneath it -> untappable.
+     *
+     * getMetrics() returns the area *excluding* system bars, so the overlay
+     * now starts below the status bar and every control is reachable.
+     */
     fun displaySize(): Pair<Int, Int> {
         @Suppress("DEPRECATION")
-        wm.defaultDisplay.getRealMetrics(dm)
+        wm.defaultDisplay.getMetrics(dm)
         return dm.widthPixels to dm.heightPixels
     }
 
@@ -97,9 +108,14 @@ class OverlayController(private val appContext: Context) {
             type,
             // NEVER steal touch (bug 1): NOT_TOUCHABLE passes every tap through
             // to the game underneath. NOT_FOCUSABLE so the game keeps input.
+            //
+            // CRITICAL FIX (Ante0 status-bar overlap): FLAG_LAYOUT_IN_SCREEN was
+            // removed. It made the window extend under the status bar (covering
+            // it and hiding the top UI). Without it, a TOP|START-gravity window
+            // sized to the *visible* area (see displaySize()) sits cleanly below
+            // the status bar and every control stays tappable.
             WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE
                     or WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE
-                    or WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN
                     or WindowManager.LayoutParams.FLAG_HARDWARE_ACCELERATED,
             PixelFormat.TRANSLUCENT
         ).apply {

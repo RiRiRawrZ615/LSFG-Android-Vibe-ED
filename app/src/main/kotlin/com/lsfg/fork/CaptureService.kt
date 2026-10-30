@@ -12,21 +12,22 @@ import android.os.Build
 import android.os.Handler
 import android.os.IBinder
 import android.os.Looper
-import android.provider.Settings
 import android.util.Log
 import androidx.core.app.NotificationCompat
-import com.lsfg.fork.overlay.OverlayController
+import com.lsfg.fork.overlay.OverlayHost
 import kotlin.concurrent.thread
 
 /**
- * Foreground service that owns the LSFG session:
+ * Foreground service that keeps the LSFG session alive:
  *  - keeps the process alive on Xiaomi/MIUI (sticky foreground notification);
- *  - hosts the visual-only overlay (TYPE_APPLICATION_OVERLAY) via [OverlayController];
- *  - exposes sticky notification controls: start/stop, multiplier cycle,
- *    capture-mode cycle, and "open app" to restore settings while gaming.
+ *  - owns the visual-only overlay via the shared [OverlayHost];
+ *  - exposes sticky notification controls (Start/Stop, multiplier, mode, open
+ *    app) so the user can always stop the session without touching the game
+ *    (bug 1).
  *
- * Notification actions work without bringing the app to the foreground, so
- * the target game is never interrupted.
+ * The overlay is attached from MainActivity while the app is foreground
+ * (most reliable on MIUI). This service only keeps the session running and
+ * provides controls, so it never re-attaches a second overlay window.
  */
 class CaptureService : Service() {
 
@@ -47,7 +48,6 @@ class CaptureService : Service() {
 
     private lateinit var nm: NotificationManager
     private val main = Handler(Looper.getMainLooper())
-    private var overlay: OverlayController? = null
     private val session: SessionManager get() = SessionManager.shared
 
     private var userDllPath: String? = null
@@ -64,6 +64,8 @@ class CaptureService : Service() {
         super.onCreate()
         nm = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
         createChannel()
+        OverlayHost.bind(applicationContext)
+        Log.i(TAG, "service onCreate")
         startForegroundSafely(buildIdleNotification("Ready."))
     }
 
@@ -90,56 +92,52 @@ class CaptureService : Service() {
     private fun startSession() {
         val sm = session
         if (sm.isRunning()) {
+            Log.i(TAG, "startSession: already running")
             updateNotificationStatus("already running")
             return
         }
-
-        // Overlay permission check.
-        if (Build.VERSION.SDK_INT >= 23 && !Settings.canDrawOverlays(this)) {
-            updateNotificationStatus("overlay permission missing - open app")
-            openApp()
-            return
-        }
-
-        val ov = OverlayController(applicationContext)
-        overlay = ov
-
-        // attach() must run on the main thread (WindowManager + SurfaceView).
-        main.post {
+        updateNotificationStatus("starting (overlay + Vulkan + capture)...")
+        // All heavy setup (surface await, Vulkan start, capture engine) runs on a
+        // background thread so it can BLOCK waiting for the overlay surface
+        // without deadlocking the main thread's surfaceCreated callback.
+        thread(name = "lsfg-begin", isDaemon = true) {
             try {
-                val (w, h) = ov.displaySize()
-                Log.i(TAG, "display ${w}x${h}, attaching overlay")
-                val ok = ov.attach()
-                val surf = ov.surface
-                if (!ok || surf == null) {
-                    updateNotificationStatus("overlay attach FAILED (grant overlay permission)")
-                    openApp()
-                    return@post
+                // Ensure the overlay window exists (fast, non-blocking). attach()
+                // is safe to call from any thread for the addView path, but the
+                // main thread is preferred; post it there and then wait for the
+                // surface on this background thread.
+                if (!OverlayHost.isAttached()) {
+                    main.post { OverlayHost.attach() }
+                    // give addView a moment to be enqueued
+                    Thread.sleep(50)
                 }
-                Log.i(TAG, "overlay attached, ${w}x${h}")
+                val surf = OverlayHost.awaitSurface(6000L)
+                if (surf == null) {
+                    Log.e(TAG, "startSession: overlay surface never ready")
+                    updateNotificationStatus("overlay surface never ready - grant 'display over other apps'")
+                    return@thread
+                }
+                val (w, h) = OverlayHost.size()
+                Log.i(TAG, "startSession: surface ready ${w}x${h} mode=${sm.state.value.captureMode}")
                 usingMediaProjection = sm.state.value.captureMode == "nonroot"
                 sm.beginSession(surf, w, h, applicationContext, userDllPath)
                 startStatusTicker()
-                updateNotificationStatus(
-                    "running: ${sm.state.value.captureMode} -> overlay ${w}x${h}"
-                )
+                updateNotificationStatus("running: ${sm.state.value.captureMode} -> overlay ${w}x${h}")
             } catch (t: Throwable) {
-                Log.e(TAG, "startSession crashed", t)
-                updateNotificationStatus("error: ${t.message}")
+                Log.e(TAG, "startSession crashed: ${t.message}")
+                updateNotificationStatus("start failed: ${t.message}")
             }
-        }
+        }.start()
     }
 
     private fun stopSession() {
+        Log.i(TAG, "stopSession")
         main.post {
-            try {
-                session.endSession()
-            } catch (t: Throwable) {
-                Log.e(TAG, "endSession", t)
-            }
+            try { session.endSession() } catch (t: Throwable) { Log.e(TAG, "endSession", t) }
             usingMediaProjection = false
-            try { overlay?.detach() } catch (_: Throwable) {}
-            overlay = null
+            // Detach the overlay so it fully releases the window (the user is
+            // done; the activity can re-attach on the next start).
+            try { OverlayHost.detach() } catch (_: Throwable) {}
             stopStatusTicker()
             startForegroundSafely(buildIdleNotification("Stopped."))
         }
@@ -160,16 +158,14 @@ class CaptureService : Service() {
         val next = modes[(modes.indexOf(cur) + 1).let { if (it >= modes.size) 0 else it }]
         sm.setCaptureMode(next)
         if (sm.isRunning()) {
-            // Apply live: full session restart (window ref is re-acquired per session).
             main.post {
-                val ov = overlay ?: return@post
-                val surf = ov.surface ?: run {
+                val surf = OverlayHost.surface ?: run {
                     updateNotificationStatus("mode switch failed: overlay gone")
                     return@post
                 }
                 try {
                     sm.endSession()
-                    val (w, h) = ov.displaySize()
+                    val (w, h) = OverlayHost.size()
                     usingMediaProjection = next == "nonroot"
                     sm.beginSession(surf, w, h, applicationContext, userDllPath)
                     updateNotificationStatus("capture mode -> $next (restarted)")
@@ -238,7 +234,6 @@ class CaptureService : Service() {
                 }
                 startForeground(NOTIF, n, type)
             } else {
-                // API 29-32: type is taken from the manifest declaration.
                 startForeground(NOTIF, n)
             }
         } catch (e: Throwable) {
@@ -291,7 +286,6 @@ class CaptureService : Service() {
             try {
                 nm.notify(NOTIF, n)
                 if (session.isRunning()) {
-                    // refresh FGS notification too (covers MIUI restarts)
                     startForegroundSafely(n)
                 }
             } catch (t: Throwable) {
@@ -313,7 +307,7 @@ class CaptureService : Service() {
         Log.i(TAG, "onDestroy")
         stopStatusTicker()
         try { session.endSession() } catch (_: Throwable) {}
-        try { overlay?.detach() } catch (_: Throwable) {}
+        try { OverlayHost.detach() } catch (_: Throwable) {}
         super.onDestroy()
     }
 }

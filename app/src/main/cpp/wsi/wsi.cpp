@@ -266,24 +266,30 @@ namespace {
     void presentLoop() {
         using namespace std::chrono_literals;
         while (g_presenter.running) {
-            int waitMs = std::max(1, static_cast<int>(1000.0 / g_presenter.targetFps) * 2);
+            // Pop a source frame (non-blocking-ish, with a short timeout so the
+            // loop can also service 'paused' and shutdown promptly).
+            int waitMs = std::max(1, static_cast<int>(1000.0 / g_presenter.targetFps));
             uintptr_t frame = lsfgdisplay::pop(waitMs);
             if (!frame) {
-                if (g_presenter.paused)
-                    std::this_thread::sleep_for(10ms);
+                if (g_presenter.paused) std::this_thread::sleep_for(5ms);
                 continue;
             }
-            if (!g_presenter.surfaceValid)
-                continue;
+            if (!g_presenter.surfaceValid) continue;
 
+            VkCommandBuffer cmdbuf = VK_NULL_HANDLE;
             try {
                 VkImage srcImage = importAhbLocked(reinterpret_cast<const void*>(frame));
-                if (!srcImage)
-                    continue;
+                if (!srcImage) continue;
 
+                // Non-blocking acquire: 0 timeout returns VK_TIMEOUT if the
+                // swapchain has no free image right now.  Using UINT64_MAX here
+                // was a hard hang (the loop would block forever on a busy / 
+                // out-of-date swapchain).  0 is the correct 'poll' value.
                 uint32_t imageIndex = 0;
-                VkResult ar = vkAcquireNextImageKHR(g_presenter.device, g_presenter.swapchain, UINT64_MAX, g_presenter.imageAcquired, VK_NULL_HANDLE, &imageIndex);
-                if (ar == VK_NOT_READY || ar == VK_TIMEOUT) {
+                VkResult ar = vkAcquireNextImageKHR(
+                    g_presenter.device, g_presenter.swapchain, 0,
+                    g_presenter.imageAcquired, VK_NULL_HANDLE, &imageIndex);
+                if (ar == VK_TIMEOUT || ar == VK_NOT_READY) {
                     std::this_thread::sleep_for(2ms);
                     continue;
                 }
@@ -291,11 +297,9 @@ namespace {
                     createSwapchain(g_presenter.width, g_presenter.height);
                     continue;
                 }
-                if (ar != VK_SUCCESS)
-                    continue;
+                if (ar != VK_SUCCESS) { WLOGE("acquire=%d", (int)ar); continue; }
 
                 vkResetCommandPool(g_presenter.device, g_presenter.cmdPool, 0);
-                VkCommandBuffer cmdbuf;
                 VkCommandBufferAllocateInfo cabi{};
                 cabi.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
                 cabi.commandPool = g_presenter.cmdPool;
@@ -346,12 +350,23 @@ namespace {
                 si.pWaitDstStageMask = &waitStage;
                 si.commandBufferCount = 1;
                 si.pCommandBuffers = &cmdbuf;
-                VK_CHECK(vkQueueSubmit(g_presenter.queue, 1, &si, g_presenter.presentFence));
+                if (vkQueueSubmit(g_presenter.queue, 1, &si, g_presenter.presentFence) != VK_SUCCESS) {
+                    vkFreeCommandBuffers(g_presenter.device, g_presenter.cmdPool, 1, &cmdbuf);
+                    cmdbuf = VK_NULL_HANDLE;
+                    continue;
+                }
 
                 VkPresentInfoKHR pi{};
                 pi.sType = VK_STRUCTURE_TYPE_PRESENT_INFO_KHR;
-                pi.waitSemaphoreCount = 1;
-                pi.pWaitSemaphores = &g_presenter.frameReady;
+                // CRITICAL FIX (was the root cause of the ~5s freeze + kill):
+                // vkQueuePresentKHR must NOT wait on a semaphore that no
+                // command buffer signals.  The old code waited on frameReady
+                // (created but never signaled) -> the GPU present hung forever
+                // -> the app was killed.  Present is allowed to start as soon
+                // as the submitted work finishes; the fence below provides the
+                // real completion signal.
+                pi.waitSemaphoreCount = 0;
+                pi.pWaitSemaphores = nullptr;
                 pi.swapchainCount = 1;
                 static VkSwapchainKHR chains[1];
                 chains[0] = g_presenter.swapchain;
@@ -360,13 +375,18 @@ namespace {
                 pi.pSwapchains = chains;
                 pi.pImageIndices = indices;
                 vkQueuePresentKHR(g_presenter.queue, &pi);
-                vkWaitForFences(g_presenter.device, 1, &g_presenter.presentFence, VK_TRUE, UINT64_MAX);
-                vkResetFences(g_presenter.device, 1, &g_presenter.presentFence);
+
+                // Wait (finite timeout) until the GPU is done with this frame
+                // before reusing any of its resources on the next iteration.
+                VkResult wr = vkWaitForFences(g_presenter.device, 1, &g_presenter.presentFence, VK_TRUE, 3000000000ull);
+                if (wr == VK_SUCCESS) vkResetFences(g_presenter.device, 1, &g_presenter.presentFence);
+                cmdbuf = VK_NULL_HANDLE; // consumed by the GPU; don't free
                 g_presenter.framesPresented++;
             } catch (const std::exception& e) {
                 WLOGE("present loop: %s", e.what());
                 std::this_thread::sleep_for(10ms);
             }
+            if (cmdbuf) vkFreeCommandBuffers(g_presenter.device, g_presenter.cmdPool, 1, &cmdbuf);
         }
     }
 } // namespace
@@ -493,6 +513,14 @@ Java_com_lsfg_fork_wsi_WsiBridge_nativePushFrame(JNIEnv*, jclass, jlong ahbPtr) 
 JNIEXPORT jint JNICALL
 Java_com_lsfg_fork_wsi_WsiBridge_nativeQueueSize(JNIEnv*, jclass) {
     return lsfgdisplay::size();
+}
+
+/** Number of frames the presenter has actually handed to vkQueuePresentKHR.
+ *  Used by the in-app pipeline self-test to report an HONEST pass/fail
+ *  (instead of claiming success when the Vulkan path never produced a frame). */
+JNIEXPORT jlong JNICALL
+Java_com_lsfg_fork_wsi_WsiBridge_nativeFramesPresented(JNIEnv*, jclass) {
+    return (jlong)g_presenter.framesPresented;
 }
 
 /**

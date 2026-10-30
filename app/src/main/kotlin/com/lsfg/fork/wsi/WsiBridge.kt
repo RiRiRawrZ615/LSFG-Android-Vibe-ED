@@ -28,6 +28,9 @@ object WsiBridge {
     /** Number of frames currently queued for presentation (backpressure monitor). */
     external fun nativeQueueSize(): Int
 
+    /** Total frames handed to vkQueuePresentKHR (honest pipeline self-test). */
+    external fun nativeFramesPresented(): Long
+
     /**
      * Fast CPU fill of a HardwareBuffer ring slot from raw RGBA8888 bytes
      * (e.g. an ImageReader plane from a MediaProjection VirtualDisplay).
@@ -44,6 +47,11 @@ object WsiBridge {
     fun setTargetFps(fps: Float) = nativeSetTargetFps(fps)
 
     fun queueSize(): Int = try { nativeQueueSize() } catch (_: Throwable) { 0 }
+
+    /** How many frames the presenter has actually presented. Used to report a
+     *  TRUE pass/fail (0 while running == the Vulkan path never produced a
+     *  frame, even though the UI may have said "running"). */
+    fun framesPresented(): Long = try { nativeFramesPresented() } catch (_: Throwable) { 0L }
 
     /**
      * Fill [ahb] (width x height RGBA8888) from [bytes] and return the native

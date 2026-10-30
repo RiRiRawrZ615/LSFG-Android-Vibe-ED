@@ -10,17 +10,21 @@ import android.hardware.display.VirtualDisplay
 import android.hardware.HardwareBuffer
 import android.media.ImageReader
 import android.media.projection.MediaProjection
+import com.lsfg.fork.Log
 import com.lsfg.fork.wsi.WsiBridge
 import com.topjohnwu.superuser.Shell
 import com.topjohnwu.superuser.ShellUtils
+import java.io.File
 import java.nio.ByteBuffer
 import kotlin.concurrent.thread
 
 /**
  * Screen capture engine with three modes:
+ *  - "root":     root `screencap` -> PNG file in the app's private dir ->
+ *                direct File read (fast, no base64 over the shell pipe).
+ *  - "shizuku":  Shizuku/shell `screencap` -> /data/local/tmp -> base64 read
+ *                (shell uid cannot write into the app's private dir).
  *  - "nonroot":  MediaProjection + VirtualDisplay + ImageReader (scrcpy-style).
- *  - "root":     root shell `screencap` -> decode -> HardwareBuffer (KernelSU).
- *  - "shizuku":  Shizuku shell `screencap` (privileged, no KernelSU).
  *
  * All modes write into a fixed ring of [HardwareBuffer] slots so the WSI
  * presenter only ever imports a small, stable set of Vulkan images (no per-frame
@@ -48,7 +52,8 @@ class CaptureEngine(
 
     private var worker: Thread? = null
     private val lock = Any()
-    private val pngPath = "/data/local/tmp/lsfg_cap.png"
+    private val tmpPath = "/data/local/tmp/lsfg_cap.png"   // shizuku path
+    private val rootFile: File = File(appContext.filesDir, "lsfg_cap.png") // root path
 
     // ---- fixed capture ring (shared by all modes) ----
     private val ringSize = 6
@@ -58,9 +63,9 @@ class CaptureEngine(
         ring = Array(ringSize) {
             HardwareBuffer.create(
                 width, height, PixelFormat.RGBA_8888, 1,
-                HardwareBuffer.USAGE_GPU_SAMPLED_IMAGE
-                        or HardwareBuffer.USAGE_CPU_READ_RARELY
-                        or HardwareBuffer.USAGE_CPU_WRITE_RARELY
+                HardwareBuffer.USAGE_GPU_SAMPLED_IMAGE or
+                        HardwareBuffer.USAGE_CPU_READ_RARELY or
+                        HardwareBuffer.USAGE_CPU_WRITE_RARELY
             )
         }
     }
@@ -74,6 +79,7 @@ class CaptureEngine(
     @Volatile private var latencySum = 0L
     @Volatile private var lastStatsTime = 0L
     @Volatile private var consecutiveErrors = 0
+    @Volatile private var lastFrameMs = 0L
 
     private fun nextRing(): HardwareBuffer {
         val buf = ring[ringIdx % ringSize]
@@ -91,10 +97,10 @@ class CaptureEngine(
             consecutiveErrors = 0
             lastStatsTime = System.currentTimeMillis()
 
-            // Set up nonroot MediaProjection capture if requested.
             if (mode == "nonroot") {
                 setupNonroot(projection)
             }
+            Log.i("CaptureEngine", "start mode=$mode ${width}x${height} interval=${minIntervalMs}ms")
 
             worker = thread(name = "lsfg-capture") {
                 while (running) {
@@ -109,25 +115,19 @@ class CaptureEngine(
                                     sink(ahb, ahbPtr)
                                 } catch (t: Throwable) {
                                     lastError = t.message ?: "framegen failed"
+                                    Log.w("CaptureEngine", "frameSink: $lastError")
                                     0
                                 }
                             } else 0
 
                             if (produced <= 0 && ahbPtr != 0L) {
-                                // Passthrough (framegen off / unavailable): present the source.
+                                // Passthrough (framegen off / unavailable): present source.
                                 WsiBridge.nativePushFrame(ahbPtr)
                             }
-                            if (produced > 0) {
-                                frames++
-                                latencySum += System.currentTimeMillis() - t0
-                                consecutiveErrors = 0
-                            } else {
-                                frames++
-                                latencySum += System.currentTimeMillis() - t0
-                                consecutiveErrors = 0
-                            }
+                            frames++
+                            latencySum += System.currentTimeMillis() - t0
+                            consecutiveErrors = 0
                         } else {
-                            // No new frame available (e.g. MediaProjection idle) -> pace and retry.
                             if (mode == "nonroot") {
                                 Thread.sleep(4)
                             }
@@ -135,7 +135,10 @@ class CaptureEngine(
                     } catch (t: Throwable) {
                         lastError = t.message ?: "capture failed"
                         consecutiveErrors++
-                        if (consecutiveErrors >= 20) {
+                        if (consecutiveErrors in listOf(1, 5, 20) || consecutiveErrors % 25 == 0) {
+                            Log.w("CaptureEngine", "capture error #$consecutiveErrors: $lastError")
+                        }
+                        if (consecutiveErrors >= 25) {
                             onStats(0f, 0f, "capture failing repeatedly: ${lastError}")
                             consecutiveErrors = 0
                         }
@@ -152,7 +155,10 @@ class CaptureEngine(
                     val now = System.currentTimeMillis()
                     if (now - lastStatsTime >= 1000L) {
                         val dt = (now - lastStatsTime) / 1000f
-                        onStats(frames / dt, if (frames > 0) latencySum / frames.toFloat() else 0f, lastError)
+                        val fps = frames / dt
+                        val avgLat = if (frames > 0) latencySum / frames.toFloat() else 0f
+                        if (fps > 0f) Log.i("CaptureEngine", String.format("%.1f fps cap avg %.0fms src=%s", fps, avgLat, lastFrameSource))
+                        onStats(fps, avgLat, lastError)
                         frames = 0
                         latencySum = 0
                         lastStatsTime = now
@@ -167,22 +173,23 @@ class CaptureEngine(
             if (!running) return
             running = false
         }
+        Log.i("CaptureEngine", "stop")
         try { worker?.interrupt() } catch (_: Throwable) {}
         try { worker?.join(800) } catch (_: Throwable) {}
         worker = null
-        // Release nonroot resources.
         try { virtualDisplay?.release() } catch (_: Throwable) {}
         virtualDisplay = null
         try { imageReader?.close() } catch (_: Throwable) {}
         imageReader = null
-        // Clean up root temp file.
-        try { ShellUtils.fastCmd("rm -f $pngPath") } catch (_: Throwable) {}
+        try { ShellUtils.fastCmd("rm -f $tmpPath") } catch (_: Throwable) {}
+        try { if (rootFile.exists()) rootFile.delete() } catch (_: Throwable) {}
     }
 
     /** Set up MediaProjection -> VirtualDisplay -> ImageReader (nonroot). */
     private fun setupNonroot(proj: MediaProjection?) {
         if (proj == null) {
             lastError = "nonroot mode requested but no MediaProjection available"
+            Log.w("CaptureEngine", lastError!!)
             return
         }
         val dpi = if (densityDpi > 0) densityDpi else 320
@@ -195,14 +202,15 @@ class CaptureEngine(
         )
         virtualDisplay = vd
         lastFrameSource = "mediaprojection"
+        Log.i("CaptureEngine", "nonroot VirtualDisplay ${width}x${height}@${dpi}dpi")
     }
 
     /** Capture one frame into the next ring slot. Returns the filled AHB or null. */
     private fun captureOnce(): HardwareBuffer? {
         return when (mode) {
             "nonroot" -> captureNonroot()
-            "shizuku" -> captureShell()
-            else -> captureShell()
+            "shizuku" -> captureShizuku()
+            else -> captureRoot()
         }
     }
 
@@ -233,23 +241,48 @@ class CaptureEngine(
         }
     }
 
-    // ---- root / shizuku: screencap -> decode -> ring (via Canvas) ----
-    private fun captureShell(): HardwareBuffer? {
-        val result = Shell.cmd("screencap -p $pngPath").exec()
-        if (!result.isSuccess) {
-            lastError = "screencap failed (code ${result.code}): ${result.err}"
+    // ---- root: screencap -> app filesDir -> direct File read (fast) ----
+    private fun captureRoot(): HardwareBuffer? {
+        // screencap writes a PNG into the app's private files dir. Root can
+        // write there even though the dir is app-owned; the app then reads the
+        // file directly (no base64 transfer over the shell pipe).
+        val res = Shell.cmd("screencap -p ${rootFile.absolutePath}").exec()
+        if (!res.isSuccess) {
+            lastError = "screencap failed (code ${res.code}): ${res.err}"
+            return null
+        }
+        val src = BitmapFactory.decodeFile(rootFile.absolutePath)
+        try { if (rootFile.exists()) rootFile.delete() } catch (_: Throwable) {}
+        if (src == null) {
+            lastError = "png decode failed (root)"
+            return null
+        }
+        return fillRing(src)
+    }
+
+    // ---- shizuku: screencap -> /data/local/tmp -> base64 read ----
+    private fun captureShizuku(): HardwareBuffer? {
+        val res = Shell.cmd("screencap -p $tmpPath").exec()
+        if (!res.isSuccess) {
+            lastError = "screencap failed (code ${res.code}): ${res.err}"
             return null
         }
         val png = readFileB64()
+        try { ShellUtils.fastCmd("rm -f $tmpPath") } catch (_: Throwable) {}
         if (png == null) {
-            lastError = "screencap read-back failed"
+            lastError = "screencap read-back failed (shizuku)"
             return null
         }
         val src = BitmapFactory.decodeByteArray(png, 0, png.size)
         if (src == null) {
-            lastError = "png decode failed"
+            lastError = "png decode failed (shizuku)"
             return null
         }
+        return fillRing(src)
+    }
+
+    /** Scale (if needed) and blit a decoded source bitmap into the next ring slot. */
+    private fun fillRing(src: Bitmap): HardwareBuffer? {
         val fitted: Bitmap = if (src.width != width || src.height != height)
             Bitmap.createScaledBitmap(src, width, height, true) ?: src
         else src
@@ -270,7 +303,7 @@ class CaptureEngine(
     }
 
     private fun readFileB64(): ByteArray? {
-        val out = Shell.cmd("base64 -w 0 $pngPath").exec()
+        val out = Shell.cmd("base64 -w 0 $tmpPath").exec()
         if (!out.isSuccess) return null
         val b64 = out.getOut().joinToString("")
         if (b64.isEmpty()) return null

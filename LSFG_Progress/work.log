@@ -41,3 +41,22 @@
 - Add MediaProjection fallback
 - Polish Material You UI
 - Optimize capture (raw RGBA screencap, zero-copy AHB)
+
+## Session: Bug-fix pass (2026-10-30)
+- Backup taken: Backups/LSFG-Fork-backup-2026-10-30_000137.tar.gz (11MB, 312 files)
+- Bug 1 (touch steal + no stop): overlay always FLAG_NOT_TOUCHABLE + NOT_FOCUSABLE; Stop button in
+  notification (idle+running) and UI; overlay attached once (shared OverlayHost) so it never steals input.
+- Bug 2 (session before permission): start flow now = notifications -> overlay -> (nonroot consent)
+  -> foreground attach -> launch target -> service. Config tab verifies each permission + runs a real
+  capture probe before allowing start.
+- Bug 3 (attribution): About tab credits LSFG-vk (PancakeTAS), Lossless Scaling, scrcpy (Genymobile),
+  volk (zeux), libsu (topjohnwu), AndroidX/Kotlin/NDK.
+- Bug 4 (test): Test tab = spinning 30fps cube (pure-Kotlin rasterizer) through the full framegen pipeline.
+- Bug 5 (logs): Log.kt persistent on-device file + Logs tab (view/refresh/export/share); all key paths log.
+- Bug 6 (root/framegen): root capture now reads PNG from app filesDir directly (no base64 over shell);
+  WSI start verified before session; framegen init/session logged; root probe added.
+- Bug 7 (kickback): overlay attached in FOREGROUND (MainActivity) not from background service; single
+  shared overlay window; game stays foreground, keeps touch.
+- libsu API fixed: Shell.Result.getOut()/getCode()/isSuccess(); ShellUtils.fastCmd(vararg):String.
+- Build: BUILD SUCCESSFUL (JDK17, AGP8.5.2, Gradle8.9, NDK27). APK 36MB, arm64-v8a + x86_64.
+- Deliverable: AI_Output/LSFG-Fork-v1.1-<ts>.apk

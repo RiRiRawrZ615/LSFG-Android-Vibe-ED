@@ -9,26 +9,47 @@ import android.net.Uri
 import android.os.Build
 import android.os.Bundle
 import android.provider.Settings
-import android.util.Log
 import android.widget.Toast
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.foundation.clickable
+import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.padding
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Surface
+import androidx.compose.material3.Text
+import androidx.compose.runtime.Composable
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableIntStateOf
+import androidx.compose.runtime.saveable.rememberSaveable
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.text.style.TextAlign
+import androidx.compose.ui.unit.dp
+import com.lsfg.fork.ui.AboutScreen
+import com.lsfg.fork.ui.ConfigScreen
 import com.lsfg.fork.ui.HomeScreen
+import com.lsfg.fork.ui.LogsScreen
+import com.lsfg.fork.overlay.OverlayHost
 import com.lsfg.fork.ui.LSFGTheme
+import com.lsfg.fork.ui.TestScreen
 
 class MainActivity : ComponentActivity() {
 
     private val session: SessionManager get() = SessionManager.shared
 
+    /** Re-enter the start flow after an async permission grant. */
+    private var pendingStart = false
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-        Log.i(SessionManager.TAG, "MainActivity onCreate, running=" + session.isRunning())
+        Log.i(SessionManager.TAG, "MainActivity onCreate, running=${session.isRunning()}")
+        OverlayHost.bind(applicationContext)
 
         setContent {
             LSFGTheme {
@@ -36,74 +57,153 @@ class MainActivity : ComponentActivity() {
                     modifier = Modifier.fillMaxSize(),
                     color = MaterialTheme.colorScheme.background
                 ) {
-                    HomeScreen(
-                        onStart = { startFlow() },
-                        onStop = { stopFlow() },
-                        onPickDll = { pickDll() },
-                        onResetDll = { resetDll() }
-                    )
+                    TabRoot()
                 }
             }
         }
     }
 
-    // ---------- start / stop ----------
+    // ==================================================================
+    //  Tabbed root: Home | Test | Config | Logs | About
+    // ==================================================================
+
+    @Composable
+    private fun TabRoot() {
+        var tab by rememberSaveable { mutableIntStateOf(0) }
+        val tabs = listOf("Home", "Test", "Config", "Logs", "About")
+        Column(Modifier.fillMaxSize()) {
+            Row(
+                Modifier
+                    .fillMaxWidth()
+                    .padding(horizontal = 8.dp, vertical = 6.dp)
+            ) {
+                tabs.forEachIndexed { i, label ->
+                    Text(
+                        text = label,
+                        modifier = Modifier
+                            .weight(1f)
+                            .padding(vertical = 6.dp)
+                            .clickable { tab = i },
+                        style = MaterialTheme.typography.labelLarge,
+                        color = if (tab == i) MaterialTheme.colorScheme.primary
+                               else MaterialTheme.colorScheme.onSurfaceVariant,
+                        textAlign = TextAlign.Center
+                    )
+                }
+            }
+            when (tab) {
+                0 -> HomeScreen(
+                    onStart = { startFlow() },
+                    onStop = { stopFlow() },
+                    onPickDll = { pickDll() },
+                    onResetDll = { resetDll() }
+                )
+                1 -> TestScreen()
+                2 -> ConfigScreen(onStart = { startFlow() })
+                3 -> LogsScreen()
+                else -> AboutScreen()
+            }
+        }
+    }
+
+    // ==================================================================
+    //  Start / stop flows (fixed: permissions FIRST, then attach, then run)
+    // ==================================================================
 
     private fun startFlow() {
-        val s = session.state.value
-
+        Log.i(SessionManager.TAG, "startFlow requested")
         if (session.isRunning()) {
             toast("Session already running")
             return
         }
+        val s = session.state.value
 
-        // 1) Notification permission (Android 13+) - required for the sticky control UI.
+        // (1) Notifications (Android 13+). Needed for the sticky control bar
+        //     (Stop button) so the user can always stop the session (bug 1).
         if (Build.VERSION.SDK_INT >= 33) {
             val granted = checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS)
             if (granted != PackageManager.PERMISSION_GRANTED) {
-                notifiPermissionLauncher.launch(Manifest.permission.POST_NOTIFICATIONS)
-                // continue anyway; the app still works, the notification may be blocked by the user
+                Log.i(SessionManager.TAG, "requesting POST_NOTIFICATIONS")
+                pendingStart = true
+                notificationPermissionLauncher.launch(Manifest.permission.POST_NOTIFICATIONS)
+                return
             }
         }
 
-        // 2) Overlay permission (draw over other apps) - required for the visual overlay.
+        // (2) Overlay permission. Must be granted BEFORE the session so the
+        //     presenter has a surface to draw into (bug 2 / bug 7).
         if (Build.VERSION.SDK_INT >= 23 && !Settings.canDrawOverlays(this)) {
-            toast("Grant 'display over other apps' to continue")
+            Log.i(SessionManager.TAG, "overlay permission missing -> opening settings")
+            toast("Grant 'Display over other apps' to continue")
             try {
                 startActivity(
                     Intent(Settings.ACTION_MANAGE_OVERLAY_PERMISSION)
-                        .apply { addFlags(Intent.FLAG_ACTIVITY_NEW_TASK) }
+                        .setPackage(packageName)
+                        .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
                 )
-            } catch (_: Throwable) {}
+            } catch (_: Throwable) {
+                try {
+                    startActivity(
+                        Intent(Settings.ACTION_MANAGE_OVERLAY_PERMISSION)
+                            .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                    )
+                } catch (_: Throwable) {}
+            }
             return
         }
 
-        // 3) Nonroot mode needs MediaProjection consent (system dialog, per session).
+        // (3) Nonroot needs MediaProjection consent (one-time system dialog).
+        //     Must be obtained BEFORE the session starts (bug 2).
         if (s.captureMode == "nonroot" && SessionManager.pendingProjectionData == null) {
-            toast("Please allow screen capture (one-time consent)")
+            Log.i(SessionManager.TAG, "requesting MediaProjection consent")
+            toast("Allow screen capture (one-time consent), then we'll continue")
+            pendingStart = true
             requestProjectionConsent()
             return
         }
 
-        // 4) Launch the target app (if selected), then start the service session.
+        // (4) All permissions in place. Attach the overlay while the app is in
+        //     the FOREGROUND (most reliable on MIUI), launch the target, then
+        //     hand off to the foreground service (keep-alive + controls).
+        proceedToStart(s)
+    }
+
+    private fun proceedToStart(s: SessionManager.State) {
+        // Attach the overlay WINDOW now (fast, non-blocking, main thread).
+        // The actual Surface becomes ready on the next main-thread frame and is
+        // awaited on a background thread inside SessionManager.beginSession.
+        val attached = OverlayHost.attach()
+        if (!attached) {
+            Log.e(SessionManager.TAG, "proceedToStart: overlay attach failed (window addView threw)")
+            toast("Overlay attach failed - grant 'display over other apps' and retry")
+            return
+        }
+        Log.i(SessionManager.TAG, "proceedToStart: overlay window attached ${OverlayHost.size().first}x${OverlayHost.size().second}")
+
+        // Launch the target app (if chosen) so it becomes foreground. The
+        // overlay (already attached) sits above it; the game keeps its touch.
         val pkg = s.targetPkg
         if (pkg != null) {
             try {
                 val li = packageManager.getLaunchIntentForPackage(pkg)
-                if (li != null) startActivity(li) else ShellBridge.launch(pkg)
+                if (li != null) startActivity(li)
+                else ShellBridge.launch(pkg)
             } catch (_: Throwable) {
                 ShellBridge.launch(pkg)
             }
+            Log.i(SessionManager.TAG, "proceedToStart: launched target $pkg")
         }
 
+        // Hand off to the foreground service (keep-alive + notification + controls).
+        // The service calls beginSession, which awaits the surface on a bg thread
+        // before starting the Vulkan presenter.
         val dllPath = DllStore.userDllPath(applicationContext)
-        window.decorView.postDelayed({
-            startServiceIntent(CaptureService.ACTION_START, dllPath)
-            toast("LSFG starting...")
-        }, if (pkg != null) 500L else 50L)
+        startServiceIntent(CaptureService.ACTION_START, dllPath)
+        toast("LSFG starting...")
     }
 
     private fun stopFlow() {
+        Log.i(SessionManager.TAG, "stopFlow requested")
         startServiceIntent(CaptureService.ACTION_STOP, null)
         toast("Stopping session...")
     }
@@ -113,13 +213,16 @@ class MainActivity : ComponentActivity() {
             val i = Intent(this, CaptureService::class.java).setAction(action)
             if (dllPath != null) i.putExtra(CaptureService.EXTRA_DLL, dllPath)
             if (Build.VERSION.SDK_INT >= 26) startForegroundService(i) else startService(i)
+            Log.i(SessionManager.TAG, "started service action=$action dll=$dllPath")
         } catch (t: Throwable) {
-            Log.e(SessionManager.TAG, "startService", t)
+            Log.e(SessionManager.TAG, "startService failed: ${t.message}")
             toast("Service start failed: ${t.message}")
         }
     }
 
-    // ---------- MediaProjection consent ----------
+    // ==================================================================
+    //  MediaProjection consent
+    // ==================================================================
 
     private fun requestProjectionConsent() {
         try {
@@ -127,12 +230,14 @@ class MainActivity : ComponentActivity() {
             val intent = mpm.createScreenCaptureIntent()
             projectionLauncher.launch(intent)
         } catch (t: Throwable) {
-            Log.e(SessionManager.TAG, "projection consent", t)
-            toast("MediaProjection unavailable: " + t.message)
+            Log.e(SessionManager.TAG, "projection consent: ${t.message}")
+            toast("MediaProjection unavailable: ${t.message}")
         }
     }
 
-    // ---------- user DLL picker ----------
+    // ==================================================================
+    //  user DLL picker
+    // ==================================================================
 
     private fun pickDll() {
         try {
@@ -143,7 +248,7 @@ class MainActivity : ComponentActivity() {
             }
             dllLauncher.launch(i)
         } catch (t: Throwable) {
-            toast("File picker failed: " + t.message)
+            toast("File picker failed: ${t.message}")
         }
     }
 
@@ -160,17 +265,28 @@ class MainActivity : ComponentActivity() {
                 target.outputStream().use { output -> input.copyTo(output) }
             }
             DllStore.setActive(applicationContext)
+            Log.i(SessionManager.TAG, "user DLL loaded: ${target.name} (${target.length()}B)")
             toast("Shader DLL loaded: ${target.name} (${target.length()} bytes)")
         } catch (t: Throwable) {
-            Log.e(SessionManager.TAG, "copyUserDll", t)
-            toast("DLL copy failed: " + t.message)
+            Log.e(SessionManager.TAG, "copyUserDll: ${t.message}")
+            toast("DLL copy failed: ${t.message}")
         }
     }
 
-    // ---------- result launchers ----------
+    // ==================================================================
+    //  result launchers
+    // ==================================================================
 
-    private val notifiPermissionLauncher =
-        registerForActivityResult(ActivityResultContracts.RequestPermission()) { }
+    private val notificationPermissionLauncher =
+        registerForActivityResult(ActivityResultContracts.RequestPermission()) { granted ->
+            Log.i(SessionManager.TAG, "POST_NOTIFICATIONS granted=$granted")
+            if (pendingStart) {
+                pendingStart = false
+                // Re-run the start flow; it will now pass the notification check
+                // and continue (overlay, consent, attach, start).
+                startFlow()
+            }
+        }
 
     private val projectionLauncher =
         registerForActivityResult(ActivityResultContracts.StartActivityForResult()) { result ->
@@ -178,12 +294,16 @@ class MainActivity : ComponentActivity() {
                 val data = result.data
                 if (data != null) {
                     SessionManager.pendingProjectionData = data
+                    Log.i(SessionManager.TAG, "MediaProjection consent granted")
                     toast("Screen capture consented. Starting...")
-                    window.decorView.postDelayed({
-                        startServiceIntent(CaptureService.ACTION_START, DllStore.userDllPath(applicationContext))
-                    }, 200L)
+                    if (pendingStart) {
+                        pendingStart = false
+                        startFlow()
+                    }
                 }
             } else {
+                pendingStart = false
+                Log.w(SessionManager.TAG, "MediaProjection consent DENIED")
                 toast("Screen capture denied - use Root mode or re-try")
             }
         }
@@ -199,5 +319,4 @@ class MainActivity : ComponentActivity() {
     private fun toast(msg: String) {
         Toast.makeText(this, msg, Toast.LENGTH_SHORT).show()
     }
-
 }

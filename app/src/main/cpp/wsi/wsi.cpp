@@ -29,6 +29,59 @@
 #define WLOG(...) __android_log_print(ANDROID_LOG_INFO, LOG_TAG, __VA_ARGS__)
 #define WLOGE(...) __android_log_print(ANDROID_LOG_ERROR, LOG_TAG, __VA_ARGS__)
 
+// --- Native crash diagnostics -------------------------------------------------
+// When the Vulkan/driver path segfaults (which is what kills the app ~1.3s after
+// 'beginSession'), the Android tombstone usually only says "Process died" and
+// the real call stack is lost.  Install a SIGSEGV/SIGBUS/SIGABRT handler that
+// logs a one-line marker to logcat (tag "lsfg-wsi") so the user's next crash
+// dump tells us EXACTLY which native step died and the fault address.  The
+// handler is minimal (async-signal-safe: only __android_log_print, no malloc /
+// std::string / printf) and always re-raises the signal so the normal Android
+// crash dump is still produced.
+#include <csignal>
+#include <string.h>
+#include <cstddef>
+static void nativeCrashHandler(int sig, siginfo_t* info, void* ctx) {
+    // Async-signal-safe: __android_log_print only.  No file I/O (the NDK 'open'
+    // and 'write' collide with other headers and fail to compile in this
+    // environment).  logcat is the canonical crash sink and is already captured.
+    //
+    // Format the signal number + fault address as a fixed-width string without
+    // malloc / snprintf / std::string (not async-signal-safe).
+    char line[96];
+    int n = 0;
+    const char* pre = "=== LSFG NATIVE CRASH === sig=";
+    for (const char* p = pre; *p && n < (int)sizeof(line) - 2; ++p) line[n++] = *p;
+    // signal number (decimal)
+    int v = sig;
+    char num[16]; int m = 0;
+    do { num[m++] = (char)('0' + (v % 10)); v /= 10; } while (v && m < 15);
+    for (int i = m - 1; i >= 0; --i) line[n++] = num[i];
+    const char* mid = " fault_addr=0x";
+    for (const char* p = mid; *p && n < (int)sizeof(line) - 2; ++p) line[n++] = *p;
+    // fault address as 16 hex digits
+    uintptr_t a = (uintptr_t)(info ? info->si_addr : nullptr);
+    for (int i = 15; i >= 0 && n < (int)sizeof(line) - 2; --i) {
+        int d = (int)((a >> (i * 4)) & 0xF);
+        line[n++] = (char)(d < 10 ? ('0' + d) : ('a' + d - 10));
+    }
+    line[n] = '\0';
+    __android_log_print(ANDROID_LOG_ERROR, "lsfg-wsi", "%s", line);
+    // Re-raise so Android still produces its normal tombstone.
+    signal(sig, SIG_DFL);
+    raise(sig);
+}
+static void installCrashHandler() {
+    struct sigaction sa{};
+    sa.sa_sigaction = nativeCrashHandler;
+    sa.sa_flags = SA_SIGINFO;
+    sigemptyset(&sa.sa_mask);
+    sigaction(SIGSEGV, &sa, nullptr);
+    sigaction(SIGBUS,  &sa, nullptr);
+    sigaction(SIGABRT, &sa, nullptr);
+}
+// --- end native crash diagnostics -------------------------------------------
+
 #define VK_CHECK(expr) do { \
         VkResult r_ = (expr); \
         if (r_ != VK_SUCCESS) { \
@@ -397,6 +450,7 @@ JNIEXPORT void JNICALL
 Java_com_lsfg_fork_wsi_WsiBridge_nativeStart(JNIEnv* env, jclass, jlong windowPtr, jint width, jint height, jfloat targetFps) {
     std::lock_guard<std::mutex> lock(g_initLock);
     if (g_presenter.running) return;
+    installCrashHandler();  // install once, before any Vulkan/driver work
     try {
         WLOG("starting presenter %dx%d targetFps=%.1f", width, height, static_cast<double>(targetFps));
 

@@ -138,6 +138,7 @@ class SessionManager : ViewModel() {
      * @param appContext used for shader DLL extraction + MediaProjection.
      * @param userDllPath optional user-supplied shader DLL.
      */
+    @Synchronized
     fun beginSession(
         surface: android.view.Surface,
         w: Int,

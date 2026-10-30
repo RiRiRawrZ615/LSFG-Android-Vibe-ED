@@ -100,34 +100,51 @@ class CaptureService : Service() {
         // All heavy setup (surface await, Vulkan start, capture engine) runs on a
         // background thread so it can BLOCK waiting for the overlay surface
         // without deadlocking the main thread's surfaceCreated callback.
-        thread(name = "lsfg-begin", isDaemon = true) {
-            try {
-                // Ensure the overlay window exists (fast, non-blocking). attach()
-                // is safe to call from any thread for the addView path, but the
-                // main thread is preferred; post it there and then wait for the
-                // surface on this background thread.
-                if (!OverlayHost.isAttached()) {
-                    main.post { OverlayHost.attach() }
-                    // give addView a moment to be enqueued
-                    Thread.sleep(50)
-                }
-                val surf = OverlayHost.awaitSurface(6000L)
-                if (surf == null) {
-                    Log.e(TAG, "startSession: overlay surface never ready")
-                    updateNotificationStatus("overlay surface never ready - grant 'display over other apps'")
-                    return@thread
-                }
-                val (w, h) = OverlayHost.size()
-                Log.i(TAG, "startSession: surface ready ${w}x${h} mode=${sm.state.value.captureMode}")
-                usingMediaProjection = sm.state.value.captureMode == "nonroot"
-                sm.beginSession(surf, w, h, applicationContext, userDllPath)
-                startStatusTicker()
-                updateNotificationStatus("running: ${sm.state.value.captureMode} -> overlay ${w}x${h}")
-            } catch (t: Throwable) {
-                Log.e(TAG, "startSession crashed: ${t.message}")
-                updateNotificationStatus("start failed: ${t.message}")
+        //
+        // CRITICAL FIX (crash: java.lang.IllegalThreadStateException at
+        // CaptureService.startSession -> Thread.start): the old code used
+        // kotlin.concurrent.thread { ... } which ALREADY starts the thread
+        // (default start=true), and then called .start() on the returned Thread
+        // a SECOND time -> "can't start a thread that has already been started"
+        // -> the service was killed on the very first real start. Use a plain
+        // Thread with a single .start() call.
+        val beginThread = Thread({ runBegin(sm) }, "lsfg-begin")
+        beginThread.isDaemon = true
+        beginThread.start()
+    }
+
+    /**
+     * Runs on a background thread: attach the overlay if needed, await the
+     * surface (blocking is allowed here, it is NOT the main thread), then
+     * start the session.  Extracted into a function so `return` works cleanly
+     * (a `return` inside a lambda passed to Thread() is "prohibited").
+     */
+    private fun runBegin(sm: SessionManager) {
+        try {
+            // Ensure the overlay window exists (fast, non-blocking). attach()
+            // must run on the main thread (WindowManager.addView), so post it
+            // there; then wait for the surface on THIS background thread.
+            if (!OverlayHost.isAttached()) {
+                main.post { OverlayHost.attach() }
+                // give addView a moment to be enqueued
+                Thread.sleep(50)
             }
-        }.start()
+            val surf = OverlayHost.awaitSurface(6000L)
+            if (surf == null) {
+                Log.e(TAG, "startSession: overlay surface never ready")
+                updateNotificationStatus("overlay surface never ready - grant 'display over other apps'")
+                return
+            }
+            val (w, h) = OverlayHost.size()
+            Log.i(TAG, "startSession: surface ready ${w}x${h} mode=${sm.state.value.captureMode}")
+            usingMediaProjection = sm.state.value.captureMode == "nonroot"
+            sm.beginSession(surf, w, h, applicationContext, userDllPath)
+            startStatusTicker()
+            updateNotificationStatus("running: ${sm.state.value.captureMode} -> overlay ${w}x${h}")
+        } catch (t: Throwable) {
+            Log.e(TAG, "startSession crashed: ${t.message}")
+            updateNotificationStatus("start failed: ${t.message}")
+        }
     }
 
     private fun stopSession() {

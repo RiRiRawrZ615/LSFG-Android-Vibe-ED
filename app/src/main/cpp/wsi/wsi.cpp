@@ -544,6 +544,27 @@ Java_com_lsfg_fork_wsi_WsiBridge_nativeStart(JNIEnv* env, jclass, jlong windowPt
     try {
         WLOG("starting presenter %dx%d targetFps=%.1f", width, height, static_cast<double>(targetFps));
 
+        // CRITICAL FIX (root cause of the ~1ms-after-start SIGSEGV, fault_addr=0):
+        // volk is a *dynamic* loader. Every vk* symbol used above is a function
+        // pointer that is only populated when volkInitialize() runs (it dlopen's
+        // libvulkan.so and resolves each entry point). The old code skipped
+        // volkInitialize() entirely, so on the very first call (vkCreateInstance)
+        // the pointer was NULL -> null-call segfault -> process killed before a
+        // single frame was ever presented. That is why the overlay "flashed" and
+        // the session died immediately in every mode (root / shizuku / nonroot).
+        // Initialize exactly once per process.
+        static bool volkReady = false;
+        if (!volkReady) {
+            VkResult vr = volkInitialize();
+            if (vr != VK_SUCCESS) {
+                WLOGE("volkInitialize failed (=%d): libvulkan.so not found? presenter cannot start", (int)vr);
+                return;
+            }
+            uint32_t vv = volkGetInstanceVersion();
+            WLOG("volk initialized, loader API %u.%u.%u", VK_VERSION_MAJOR(vv), VK_VERSION_MINOR(vv), VK_VERSION_PATCH(vv));
+            volkReady = true;
+        }
+
         VkApplicationInfo appInfo{};
         appInfo.sType = VK_STRUCTURE_TYPE_APPLICATION_INFO;
         appInfo.pApplicationName = "LSFG-Fork";

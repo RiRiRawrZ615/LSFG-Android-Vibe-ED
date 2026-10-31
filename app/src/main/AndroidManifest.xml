@@ -36,5 +36,18 @@
                 android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE"
                 android:value="screen frame interpolation overlay" />
         </service>
+
+        <!-- Exposes exported log files to other apps (share / file manager)
+             over a content:// URI. Required on API 24+; sharing a file://
+             Uri directly throws FileUriExposedException (bugs 5/6). -->
+        <provider
+            android:name="androidx.core.content.FileProvider"
+            android:authorities="${applicationId}.files"
+            android:exported="false"
+            android:grantUriPermissions="true">
+            <meta-data
+                android:name="android.support.FILE_PROVIDER_PATHS"
+                android:resource="@xml/file_paths" />
+        </provider>
     </application>
 </manifest>

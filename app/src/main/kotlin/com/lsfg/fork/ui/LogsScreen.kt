@@ -2,6 +2,7 @@ package com.lsfg.fork.ui
 
 import android.content.Intent
 import android.net.Uri
+import androidx.core.content.FileProvider
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.rememberScrollState
@@ -87,7 +88,25 @@ fun LogsScreen() {
                             handler.post {
                                 exporting = false
                                 if (path != null) {
-                                    shareUri = Uri.fromFile(java.io.File(path))
+                                    // CRITICAL FIX (bug: "logs don't export to
+                                    // downloads / share crashes"): the old code
+                                    // used Uri.fromFile() -> a file:// URI.
+                                    // Sharing a file:// URI on API 24+ throws
+                                    // FileUriExposedException ("exposed beyond
+                                    // app through ClipData"). Use FileProvider so
+                                    // the share target receives a content:// URI
+                                    // with read permission granted. If the export
+                                    // already produced a MediaStore content://
+                                    // URI string, use it as-is.
+                                    shareUri = if (path.startsWith("content:")) {
+                                        Uri.parse(path)
+                                    } else {
+                                        FileProvider.getUriForFile(
+                                            ctx,
+                                            "${ctx.packageName}.files",
+                                            java.io.File(path)
+                                        )
+                                    }
                                 }
                             }
                         }, "lsfg-export").apply { isDaemon = true; start() }
@@ -103,6 +122,7 @@ fun LogsScreen() {
                                 type = "text/plain"
                                 putExtra(Intent.EXTRA_STREAM, u)
                                 addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+                                addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
                             }
                             ctx.startActivity(Intent.createChooser(share, "Share LSFG log"))
                         } catch (t: Throwable) {

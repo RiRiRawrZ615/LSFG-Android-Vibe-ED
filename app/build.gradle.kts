@@ -12,8 +12,8 @@ android {
         applicationId = "com.lsfg.fork"
         minSdk = 29
         targetSdk = 35
-        versionCode = 5
-        versionName = "1.5"
+        versionCode = 6
+        versionName = "1.6"
         ndk {
             abiFilters += listOf("arm64-v8a", "x86_64")
         }
@@ -67,6 +67,7 @@ dependencies {
     implementation("androidx.activity:activity-compose:1.9.2")
     implementation("androidx.lifecycle:lifecycle-runtime-ktx:2.8.6")
     implementation("androidx.lifecycle:lifecycle-viewmodel-compose:2.8.6")
+    implementation("androidx.lifecycle:lifecycle-runtime-compose:2.8.6")
 
     // libsu 5.x (com.topjohnwu.superuser API) for root shell execution
     implementation("com.github.topjohnwu.libsu:core:5.3.0")

@@ -21,6 +21,10 @@ import androidx.compose.ui.unit.dp
 import com.lsfg.fork.Log
 import com.lsfg.fork.RootChecker
 import com.lsfg.fork.SessionManager
+import androidx.compose.runtime.DisposableEffect
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.LifecycleEventObserver
+import androidx.lifecycle.compose.LocalLifecycleOwner
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 
@@ -59,7 +63,25 @@ fun ConfigScreen(onStart: () -> Unit) {
         else true
     }
 
-    DisposableEffect(Unit) { onDispose { refreshPerms() } }
+    // CRITICAL FIX (bug: "Grant the permissions above first" always shows):
+    // the chips were only refreshed on a manual tap and onDispose. When the user
+    // taps "Grant overlay permission" the system settings page opens (this
+    // composable leaves STARTED), and on return the chips were NEVER re-read, so
+    // they stayed red and Start stayed disabled even though the permission was
+    // actually granted. Refresh on every ON_START (return from settings / picker)
+    // so the chips always reflect the live permission state.
+    val lifecycleOwner = LocalLifecycleOwner.current
+    DisposableEffect(lifecycleOwner) {
+        val observer = LifecycleEventObserver { _, event ->
+            if (event == Lifecycle.Event.ON_START) refreshPerms()
+        }
+        lifecycleOwner.lifecycle.addObserver(observer)
+        refreshPerms()
+        onDispose {
+            lifecycleOwner.lifecycle.removeObserver(observer)
+            refreshPerms()
+        }
+    }
 
     Column(
         Modifier

@@ -1,0 +1,9 @@
+<?xml version="1.0" encoding="utf-8"?>
+<paths>
+    <!-- App-private external files dir (where Log.exportToDownloads writes). -->
+    <external-files-path name="lsfg_exports" path="." />
+    <!-- App-internal files dir (last-resort export location). -->
+    <files-path name="lsfg_files" path="." />
+    <!-- Public Downloads (in case a MediaStore path is ever exposed). -->
+    <external-path name="lsfg_downloads" path="Downloads" />
+</paths>

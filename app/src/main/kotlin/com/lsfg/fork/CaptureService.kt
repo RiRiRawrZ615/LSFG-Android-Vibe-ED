@@ -54,6 +54,10 @@ class CaptureService : Service() {
     private var userDllPath: String? = null
     private var tickJob: Thread? = null
     @Volatile private var usingMediaProjection = false
+    /** True only while a live MediaProjection object actually exists. The FGS
+     *  mediaProjection type may only be declared while this is true (API 34+),
+     *  otherwise startForeground is rejected. */
+    @Volatile private var hasActiveProjection = false
 
     private data class Multi(val value: Int, val label: String)
     private val multis = listOf(Multi(1, "1x"), Multi(2, "2x"), Multi(3, "3x"), Multi(4, "4x"))
@@ -165,6 +169,12 @@ class CaptureService : Service() {
             Log.i(TAG, "startSession: surface ready ${w}x${h} mode=${sm.state.value.captureMode}")
             usingMediaProjection = sm.state.value.captureMode == "nonroot"
             sm.beginSession(surf, w, h, applicationContext, userDllPath)
+            // beginSession created the MediaProjection (nonroot). Only NOW is it
+            // legal to declare the FGS mediaProjection type; before that
+            // (PREPARE / consent picker) we must stay on specialUse only, or
+            // API 34 rejects startForeground (the "stuck on Idle" bug).
+            hasActiveProjection = sm.state.value.captureMode == "nonroot" &&
+                    (sm.activeProjection != null)
             startStatusTicker()
             updateNotificationStatus("running: ${sm.state.value.captureMode} -> overlay ${w}x${h}")
         } catch (t: Throwable) {
@@ -178,6 +188,7 @@ class CaptureService : Service() {
         main.post {
             try { session.endSession() } catch (t: Throwable) { Log.e(TAG, "endSession", t) }
             usingMediaProjection = false
+            hasActiveProjection = false
             // Detach the overlay so it fully releases the window (the user is
             // done; the activity can re-attach on the next start).
             try { OverlayHost.detach() } catch (_: Throwable) {}
@@ -268,11 +279,19 @@ class CaptureService : Service() {
     private fun startForegroundSafely(n: Notification) {
         try {
             if (Build.VERSION.SDK_INT >= 33) {
-                // API 33+: always declare a valid FGS type (specialUse base),
-                // adding mediaProjection only while a MediaProjection is in use
-                // (API 34+ enforces that declared mediaProjection is actually active).
+                // CRITICAL FIX (bug: notification stuck on "Idle" + FGS crash):
+                // On API 34+ the system REJECTS startForeground when the declared
+                // FGS type is mediaProjection but no MediaProjection session is
+                // actually active yet (validateForegroundServiceType ->
+                // SecurityException, which was killing the service and pinning
+                // the notification on the idle text). So we must NOT claim the
+                // mediaProjection type during ACTION_PREPARE (before the consent
+                // dialog is even answered). We only add it once a real
+                // MediaProjection exists (set in runBegin after beginSession).
+                // The specialUse base type alone keeps the service foreground
+                // alive through the consent picker.
                 var type = ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE
-                if (usingMediaProjection) {
+                if (usingMediaProjection && hasActiveProjection) {
                     type = type or ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PROJECTION
                 }
                 startForeground(NOTIF, n, type)
@@ -280,7 +299,12 @@ class CaptureService : Service() {
                 startForeground(NOTIF, n)
             }
         } catch (e: Throwable) {
-            Log.e(TAG, "startForeground", e)
+            // Never let a FGS-type mismatch kill the service. Fall back to the
+            // plain specialUse type so the session/notification always survives.
+            Log.e(TAG, "startForeground failed (type mismatch?): ${e.message}")
+            try {
+                startForeground(NOTIF, n, ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE)
+            } catch (_: Throwable) {}
         }
     }
 

@@ -471,6 +471,11 @@ class SessionManager : ViewModel() {
 
     fun isRunning(): Boolean = _state.value.running
 
+    /** The live MediaProjection object (nonroot only), or null. Used by the
+     *  service to decide whether it may declare the FGS mediaProjection type
+     *  (only legal while a real projection exists on API 34+). */
+    val activeProjection: MediaProjection? get() = mediaProjection
+
     override fun onCleared() {
         endSession()
     }

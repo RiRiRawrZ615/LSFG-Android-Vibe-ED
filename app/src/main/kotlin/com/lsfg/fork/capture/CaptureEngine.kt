@@ -62,20 +62,15 @@ class CaptureEngine(
     private val tmpPath = "/data/local/tmp/lsfg_cap.png"   // shizuku path
     private val rootFile: File = File(appContext.filesDir, "lsfg_cap.png") // root path
 
-    // ---- fixed capture ring (shared by all modes) ----
-    private val ringSize = 6
-    private val ring: Array<HardwareBuffer>
-    private var ringIdx = 0
-    init {
-        ring = Array(ringSize) {
-            HardwareBuffer.create(
-                width, height, PixelFormat.RGBA_8888, 1,
-                HardwareBuffer.USAGE_GPU_SAMPLED_IMAGE or
-                        HardwareBuffer.USAGE_CPU_READ_RARELY or
-                        HardwareBuffer.USAGE_CPU_WRITE_RARELY
-            )
-        }
-    }
+    // ---- capture source AHBs (fresh per frame, NOT reused) ----
+    // CRITICAL FIX (bug: native crash sig=6 in WSI present loop on first
+    // captured frame): the old code reused a fixed 6-AHB ring, but the WSI
+    // caches the imported VkImage by AHB pointer and re-reads it on the next
+    // frame while the capture thread has already overwritten that ring slot ->
+    // use-after-free -> abort. The test pattern (fresh AHB per frame) never
+    // hit this, which is why "all modes" testing looked fine. Fresh AHBs per
+    // frame (as the reference and the test pattern use) eliminate the race.
+    // The WSI releases the source AHB after the GPU finishes with it.
 
     // ---- nonroot (MediaProjection) state ----
     @Volatile private var imageReader: ImageReader? = null
@@ -88,10 +83,11 @@ class CaptureEngine(
     @Volatile private var consecutiveErrors = 0
     @Volatile private var lastFrameMs = 0L
 
-    private fun nextRing(): HardwareBuffer {
-        val buf = ring[ringIdx % ringSize]
-        ringIdx = (ringIdx + 1) % ringSize
-        return buf
+    private fun newSourceAhb(): HardwareBuffer {
+        return HardwareBuffer.create(
+            width, height, PixelFormat.RGBA_8888, 1,
+            HardwareBuffer.USAGE_GPU_SAMPLED_IMAGE
+        )
     }
 
     fun start() {
@@ -253,7 +249,7 @@ class CaptureEngine(
             if (n < width * height * 4) return null
             val bytes = ByteArray(n)
             buf.duplicate().get(bytes)
-            val ahb = nextRing()
+            val ahb = newSourceAhb()
             val ptr = WsiBridge.fillAhb(ahb, bytes, plane.rowStride)
             if (ptr == 0L) {
                 lastError = "nonroot: fillAhb failed"
@@ -322,25 +318,62 @@ class CaptureEngine(
         return fillRing(src)
     }
 
-    /** Scale (if needed) and blit a decoded source bitmap into the next ring slot. */
-    private fun fillRing(src: Bitmap): HardwareBuffer? {
-        val fitted: Bitmap = if (src.width != width || src.height != height)
-            Bitmap.createScaledBitmap(src, width, height, true) ?: src
-        else src
-        if (fitted !== src) src.recycle()
-
-        val ahb = nextRing()
-        val hw = Bitmap.wrapHardwareBuffer(ahb, ColorSpace.get(ColorSpace.Named.SRGB))
-        if (hw == null) {
-            fitted.recycle()
-            lastError = "wrapHardwareBuffer failed"
-            return null
+    /** Scale (if needed) and blit a decoded source bitmap into the next ring slot.
+     *
+     * CRITICAL FIX (bug: "capture error: Immutable bitmap passed to Canvas
+     * constructor" on every frame -> root capture produced ZERO frames -> the
+     * overlay was never visibly updated):
+     *  - BitmapFactory.decodeFile/decodeByteArray return IMMUTABLE bitmaps on
+     *    modern Android. The old code wrapped the ring AHB in a
+     *    Bitmap.wrapHardwareBuffer bitmap and did Canvas(hw).drawBitmap(...).
+     *    A wrapped-HardwareBuffer bitmap is IMMUTABLE, and the Canvas(Bitmap)
+     *    constructor rejects an immutable bitmap -> threw every frame.
+     *  - Fix: never construct a Canvas on a wrapped-HardwareBuffer bitmap.
+     *    Scale into a small throwaway MUTABLE CPU bitmap (Canvas on a CPU
+     *    bitmap is always legal; drawBitmap() only READS the immutable source
+     *    so that is fine), then copy the pixels into the AHB with a plain CPU
+     *    memcpy (WsiBridge.nativeFillAhb). This path has no Canvas-on-hardware
+     *    buffer and no immutability assumption, so it works on every device.
+     */
+    /**
+     * Read [src] into a fresh RGBA8888 ByteArray sized [w]x[h], scaling if needed.
+     * Uses getPixels() (ARGB IntArray) which is always legal to READ from an
+     * immutable bitmap, then packs to RGBA8888 bytes. No Canvas, no immutability.
+     */
+    private fun readRgba8888(src: Bitmap, w: Int, h: Int): ByteArray? {
+        val scaled: Bitmap = if (src.width != w || src.height != h) {
+            Bitmap.createScaledBitmap(src, w, h, true)
+        } else src
+        val argb = IntArray(w * h)
+        try { scaled.getPixels(argb, 0, w, 0, 0, w, h) } finally {
+            if (scaled !== src) scaled.recycle()
         }
-        Canvas(hw).drawBitmap(fitted, 0f, 0f, null)
-        hw.recycle()
-        fitted.recycle()
-        lastFrameSource = if (mode == "shizuku") "shizuku" else "root"
-        return ahb
+        val out = ByteArray(w * h * 4)
+        var o = 0
+        for (a in argb) {
+            out[o++] = ((a shr 16) and 0xFF).toByte()   // R
+            out[o++] = ((a shr 8) and 0xFF).toByte()    // G
+            out[o++] = (a and 0xFF).toByte()            // B
+            out[o++] = ((a shr 24) and 0xFF).toByte()   // A
+        }
+        return out
+    }
+
+    private fun fillRing(src: Bitmap): HardwareBuffer? {
+        val ahb = newSourceAhb()
+        try {
+            val rgba = readRgba8888(src, width, height)
+                ?: run { lastError = "fillRing: readRgba8888 failed"; return null }
+            val ptr = WsiBridge.fillAhb(ahb, rgba, width * 4)
+            if (ptr == 0L) { lastError = "fillRing: fillAhb failed"; return null }
+            lastFrameSource = if (mode == "shizuku") "shizuku" else "root"
+            return ahb
+        } catch (t: Throwable) {
+            lastError = "fillRing: ${t.message}"
+            return null
+        } finally {
+            try { src.recycle() } catch (_: Throwable) {}
+        }
     }
 
     private fun readFileB64(): ByteArray? {
@@ -357,6 +390,5 @@ class CaptureEngine(
 
     fun release() {
         stop()
-        ring.forEach { try { it.close() } catch (_: Throwable) {} }
     }
 }

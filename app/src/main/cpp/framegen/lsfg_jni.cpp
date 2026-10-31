@@ -3,6 +3,7 @@
 #include "lsfgvk.hpp"
 #include "lsfg_display.h"
 #include "vkhelper.hpp"
+#include "jnifile_log.h"
 
 #include <android/log.h>
 #include <android/hardware_buffer.h>
@@ -20,8 +21,8 @@
 #include <vk>
 
 #define LOG_TAG "lsfg-framegen"
-#define FLOG(...) __android_log_print(ANDROID_LOG_INFO, LOG_TAG, __VA_ARGS__)
-#define FLOGE(...) __android_log_print(ANDROID_LOG_ERROR, LOG_TAG, __VA_ARGS__)
+#define FLOG(...) lsfgjlog::logprintf(ANDROID_LOG_INFO, LOG_TAG, __VA_ARGS__)
+#define FLOGE(...) lsfgjlog::logprintf(ANDROID_LOG_ERROR, LOG_TAG, __VA_ARGS__)
 
 namespace {
 
@@ -419,3 +420,10 @@ Java_com_lsfg_fork_framegen_FramegenBridge_nativeDestroy(
 }
 
 } // extern "C"
+
+extern "C" JNIEXPORT jint JNICALL JNI_OnLoad(JavaVM* vm, void* reserved) {
+    JNIEnv* env = nullptr;
+    if (vm->GetEnv((void**)&env, JNI_VERSION_1_6) == JNI_OK)
+        lsfgjlog::init(env, vm);
+    return JNI_VERSION_1_6;
+}

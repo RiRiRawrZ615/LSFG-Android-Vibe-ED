@@ -45,6 +45,8 @@ class CaptureService : Service() {
         const val ACTION_OPEN = "com.lsfg.fork.OPEN"
 
         const val EXTRA_DLL = "user_dll_path"
+        /** Set on the ACTION_START intent when the consent token is already held. */
+        const val EXTRA_HAS_CONSENT = "has_consent"
     }
 
     private lateinit var nm: NotificationManager
@@ -58,6 +60,12 @@ class CaptureService : Service() {
      *  mediaProjection type may only be declared while this is true (API 34+),
      *  otherwise startForeground is rejected. */
     @Volatile private var hasActiveProjection = false
+    /** True once the MediaProjection consent token is held. On API 34+ (U) the
+     *  `mediaProjection` foreground-service type may only be started while the
+     *  consent is held, and `getMediaProjection()` REQUIRES that type to be
+     *  running. So before beginSession we declare the type (legal here, token
+     *  held) so getMediaProjection succeeds inside beginSession. */
+    @Volatile private var consentHeld = false
 
     private data class Multi(val value: Int, val label: String)
     private val multis = listOf(Multi(1, "1x"), Multi(2, "2x"), Multi(3, "3x"), Multi(4, "4x"))
@@ -91,7 +99,10 @@ class CaptureService : Service() {
                 startForegroundSafely(buildIdleNotification("Waiting for screen capture consent..."))
                 Log.i(TAG, "ACTION_PREPARE: holding mediaProjection FGS for the consent picker")
             }
-            ACTION_START -> startSession()
+            ACTION_START -> {
+                consentHeld = intent?.getBooleanExtra(EXTRA_HAS_CONSENT, false) ?: false
+                startSession()
+            }
             // CRITICAL FIX ("repeatedly loops and crashes"): on a null intent the
             // system is restarting this START_STICKY service AFTER the process was
             // killed (usually by a native crash).  The old code did
@@ -168,6 +179,16 @@ class CaptureService : Service() {
             val (w, h) = OverlayHost.size()
             Log.i(TAG, "startSession: surface ready ${w}x${h} mode=${sm.state.value.captureMode}")
             usingMediaProjection = sm.state.value.captureMode == "nonroot"
+            // CRITICAL (API 34+/U, nonroot): getMediaProjection() requires a
+            // RUNNING mediaProjection foreground service, and the type may only
+            // be started while the consent token is held. PREPARE runs before
+            // consent (so it stays specialUse only). Now that consent is held
+            // (EXTRA_HAS_CONSENT), declare the mediaProjection type BEFORE
+            // beginSession so getMediaProjection() succeeds inside it. Without
+            // this, nonroot capture produced zero frames on every U device.
+            if (usingMediaProjection && consentHeld) {
+                startForegroundSafely(buildIdleNotification("Preparing screen capture..."))
+            }
             sm.beginSession(surf, w, h, applicationContext, userDllPath)
             // beginSession created the MediaProjection (nonroot). Only NOW is it
             // legal to declare the FGS mediaProjection type; before that
@@ -291,7 +312,7 @@ class CaptureService : Service() {
                 // The specialUse base type alone keeps the service foreground
                 // alive through the consent picker.
                 var type = ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE
-                if (usingMediaProjection && hasActiveProjection) {
+                if (usingMediaProjection && (hasActiveProjection || consentHeld)) {
                     type = type or ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PROJECTION
                 }
                 startForeground(NOTIF, n, type)

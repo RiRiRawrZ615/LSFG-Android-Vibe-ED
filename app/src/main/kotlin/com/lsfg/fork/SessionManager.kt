@@ -43,6 +43,18 @@ class SessionManager : ViewModel() {
         @Volatile
         var pendingProjectionData: android.content.Intent? = null
 
+        /**
+         * Live MediaProjection created IMMEDIATELY at consent time (in the
+         * activity, on the main thread). Created here rather than later in
+         * the service's beginSession because getMediaProjection() can return
+         * null if the consent data is consumed late / from another process
+         * context (reproduced on Android 14: 'MediaProjection created' then
+         * 'no MediaProjection consent' -> zero frames). beginSession consumes
+         * this first and falls back to pendingProjectionData.
+         */
+        @Volatile
+        var pendingProjection: MediaProjection? = null
+
         const val TAG = "lsfg-fork"
     }
 
@@ -352,6 +364,15 @@ class SessionManager : ViewModel() {
     }
 
     private fun createProjection(appContext: Context): MediaProjection? {
+        // Fast path (reliable): the activity created a live MediaProjection at
+        // consent time (main thread, fresh token). Consume it directly.
+        pendingProjection?.let { mp ->
+            pendingProjection = null
+            registerProjectionCallback(mp)
+            Log.i(TAG, "using MediaProjection created at consent")
+            return mp
+        }
+        // Fallback: create from the stashed consent data (legacy path).
         return try {
             val data = pendingProjectionData
             if (data == null) {
@@ -359,13 +380,43 @@ class SessionManager : ViewModel() {
                 null
             } else {
                 val mpm = appContext.getSystemService(MediaProjectionManager::class.java)
-                val mp = mpm.getMediaProjection(Build.VERSION.SDK_INT, data)
-                Log.i(TAG, "MediaProjection created (nonroot)")
+                // The first arg MUST be the consent dialog's result code
+                // (Activity.RESULT_OK = -1). getMediaProjection() returns null
+                // when it is not RESULT_OK, so passing Build.VERSION.SDK_INT
+                // (the old bug) made nonroot capture produce zero frames.
+                val mp = mpm.getMediaProjection(android.app.Activity.RESULT_OK, data)
+                if (mp != null) {
+                    registerProjectionCallback(mp)
+                    Log.i(TAG, "MediaProjection created (nonroot)")
+                } else {
+                    Log.w(TAG, "getMediaProjection returned null (consent data stale?)")
+                }
                 mp
             }
         } catch (t: Throwable) {
             Log.e(TAG, "createProjection failed: ${t.message}")
             null
+        }
+    }
+
+    /**
+     * Android 14 (U) REQUIRES a MediaProjection.Callback to be registered
+     * before the projection is used to create a VirtualDisplay
+     * ("Must register a callback before starting capture"). We register on a
+     * main-thread Handler so the callback fires on the main looper.
+     */
+    private fun registerProjectionCallback(mp: MediaProjection) {
+        try {
+            mp.registerCallback(
+                object : MediaProjection.Callback() {
+                    override fun onStop() {
+                        Log.w(TAG, "MediaProjection.onStop (system revoked capture)")
+                    }
+                },
+                android.os.Handler(android.os.Looper.getMainLooper())
+            )
+        } catch (t: Throwable) {
+            Log.w(TAG, "registerProjectionCallback failed: ${t.message}")
         }
     }
 
@@ -405,7 +456,29 @@ class SessionManager : ViewModel() {
                 _state.update { it.copy(statusMsg = "framegen init failed: shader DLL ($dllPath)") }
                 return false
             }
-            val okSession = FramegenBridge.createSession(w, h, s.flowScale, s.performance)
+            // CRITICAL FIX (bug: "no framegen ever happens" in every mode):
+            // the v3.1 pipeline builds a 7-level mipmap chain by halving the
+            // extent each level. An ODD height makes a level fractional
+            // (e.g. 2186 -> 1093 -> 546.5) and image creation fails ->
+            // createSession throws -> passthrough. Since v1.4 the overlay is
+            // the *visible* area (below the status bar), which on the user's
+            // device is 1080x2186 (2186 = 2*1093, prime) -> framegen always
+            // failed. Align the COMPUTE session down to a multiple of 16 (the
+            // WSI swapchain still renders the real overlay size, and the
+            // source/dest AHBs stay the real capture size; framegen just
+            // operates on the aligned extent). 2186 -> 2176 = 2^4 * 136,
+            // every mipmap level stays even.
+            val align = 16
+            val fw = (w / align) * align
+            val fh = (h / align) * align
+            val okSession = if (fw >= align && fh >= align) {
+                FramegenBridge.createSession(fw, fh, s.flowScale, s.performance)
+            } else {
+                false
+            }
+            if (fw != w || fh != h) {
+                Log.i(TAG, "framegen session aligned ${w}x${h} -> ${fw}x${fh} (mipmap-safe)")
+            }
             if (!okSession) {
                 FramegenBridge.destroy()
                 Log.e(TAG, "framegen createSession FAILED ${w}x${h} flow=${s.flowScale}")
@@ -459,6 +532,8 @@ class SessionManager : ViewModel() {
         dstPool.clear()
         try { mediaProjection?.stop() } catch (_: Throwable) {}
         mediaProjection = null
+        pendingProjection?.let { try { it.stop() } catch (_: Throwable) {} }
+        pendingProjection = null
         if (windowPtr != 0L) {
             WsiBridge.nativeReleaseWindow(windowPtr)
             windowPtr = 0L

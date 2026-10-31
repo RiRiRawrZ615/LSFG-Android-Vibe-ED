@@ -226,6 +226,14 @@ class MainActivity : ComponentActivity() {
         try {
             val i = Intent(this, CaptureService::class.java).setAction(action)
             if (dllPath != null) i.putExtra(CaptureService.EXTRA_DLL, dllPath)
+            // Tell the service the MediaProjection consent token is held, so it
+            // can declare the mediaProjection FGS type BEFORE beginSession
+            // (required by getMediaProjection on API 34+/U).
+            if (action == CaptureService.ACTION_START &&
+                SessionManager.pendingProjectionData != null
+            ) {
+                i.putExtra(CaptureService.EXTRA_HAS_CONSENT, true)
+            }
             if (Build.VERSION.SDK_INT >= 26) startForegroundService(i) else startService(i)
             Log.i(SessionManager.TAG, "started service action=$action dll=$dllPath")
         } catch (t: Throwable) {
@@ -308,6 +316,30 @@ class MainActivity : ComponentActivity() {
                 val data = result.data
                 if (data != null) {
                     SessionManager.pendingProjectionData = data
+                    // Create the MediaProjection IMMEDIATELY at consent (main
+                    // thread, fresh token). Consuming the token late in the
+                    // service's beginSession makes getMediaProjection() return
+                    // null (reproduced on Android 14) -> zero frames. A live
+                    // object created here is always usable by beginSession.
+                    try {
+                        val mpm = getSystemService(Context.MEDIA_PROJECTION_SERVICE)
+                            as android.media.projection.MediaProjectionManager
+                        // The first arg is the result code from the consent
+                        // dialog (RESULT_OK = -1), NOT the SDK version. Passing
+                        // Build.VERSION.SDK_INT here made getMediaProjection()
+                        // return null (reproduced on Android 14 + user device).
+                        val mp = mpm.getMediaProjection(
+                            result.resultCode, data
+                        )
+                        if (mp != null) {
+                            SessionManager.pendingProjection = mp
+                            Log.i(SessionManager.TAG, "MediaProjection created at consent")
+                        } else {
+                            Log.w(SessionManager.TAG, "getMediaProjection null at consent (will retry in session)")
+                        }
+                    } catch (t: Throwable) {
+                        Log.e(SessionManager.TAG, "create MediaProjection at consent failed: ${t.message}")
+                    }
                     Log.i(SessionManager.TAG, "MediaProjection consent granted")
                     // ALWAYS resume the start flow on consent (not only when
                     // pendingStart is set): the activity may have been recreated

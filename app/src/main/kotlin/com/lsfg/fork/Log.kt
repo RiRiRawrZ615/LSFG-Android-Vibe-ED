@@ -150,6 +150,28 @@ object Log {
     fun w(msg: String) = log(Level.W, TAG, msg)
     fun e(msg: String) = log(Level.E, TAG, msg)
 
+    /**
+     * Native-side log entry point. The C++ framegen/WSI libraries call this via
+     * JNI (see nativeLog below) so their logcat lines ALSO get persisted into the
+     * exported on-device log file. Previously the exported log only contained
+     * Kotlin lines, so a failure like "framegen createSession FAILED" was logged
+     * in Kotlin but the REAL reason (the C++ exception / Vulkan error) only went
+     * to logcat and was invisible in the user's exported file (bugs 3/4).
+     */
+    /**
+     * Native-side log entry point. The C++ framegen/WSI libraries call this via
+     * JNI so their logcat lines ALSO get persisted into the exported on-device
+     * log file. Previously the exported log only contained Kotlin lines, so a
+     * failure like "framegen createSession FAILED" was logged in Kotlin but the
+     * REAL reason (the C++ exception / Vulkan error) only went to logcat and was
+     * invisible in the user's exported file.
+     */
+    @JvmStatic
+    fun nativeLog(level: Int, tag: String, msg: String) {
+        val lv = try { Level.fromCode(level) } catch (_: Throwable) { Level.I }
+        log(lv, tag, msg)
+    }
+
     /** Path to the current log file (for the Logs UI / sharing). */
     fun currentFile(ctx: Context): File {
         init(ctx)

@@ -11,6 +11,7 @@
 
 #include "volk.h"
 #include "lsfg_display.h"
+#include "jnifile_log.h"
 
 #include <algorithm>
 #include <atomic>
@@ -26,8 +27,8 @@
 #include <vector>
 
 #define LOG_TAG "lsfg-wsi"
-#define WLOG(...) __android_log_print(ANDROID_LOG_INFO, LOG_TAG, __VA_ARGS__)
-#define WLOGE(...) __android_log_print(ANDROID_LOG_ERROR, LOG_TAG, __VA_ARGS__)
+#define WLOG(...) lsfgjlog::logprintf(ANDROID_LOG_INFO, LOG_TAG, __VA_ARGS__)
+#define WLOGE(...) lsfgjlog::logprintf(ANDROID_LOG_ERROR, LOG_TAG, __VA_ARGS__)
 
 // --- Native crash diagnostics -------------------------------------------------
 // When the Vulkan/driver path segfaults (which is what kills the app ~1.3s after
@@ -41,6 +42,12 @@
 #include <csignal>
 #include <string.h>
 #include <cstddef>
+#include <dlfcn.h>
+// Save the pre-existing handler per signal so we can CHAIN to it (the linker
+// crash handler) instead of re-raising with SIG_DFL.  Re-raising with SIG_DFL
+// replaces the linker's handler with the kernel default, which DROPS the full
+// Android backtrace / tombstone.  Chaining preserves it.
+static struct sigaction s_prev_action[NSIG];
 static void nativeCrashHandler(int sig, siginfo_t* info, void* ctx) {
     // Async-signal-safe: __android_log_print only.  No file I/O (the NDK 'open'
     // and 'write' collide with other headers and fail to compile in this
@@ -67,7 +74,40 @@ static void nativeCrashHandler(int sig, siginfo_t* info, void* ctx) {
     }
     line[n] = '\0';
     __android_log_print(ANDROID_LOG_ERROR, "lsfg-wsi", "%s", line);
-    // Re-raise so Android still produces its normal tombstone.
+    // Runtime backtrace via dlsym (the linked libc variant does not export
+    // backtrace as a strong symbol, so resolve it at runtime). Best-effort,
+    // not strictly async-signal-safe, but reliable in practice on bionic.
+    do {
+        using bt_fn = int (*)(void**, int);
+        using btf_fn = void (*)(void* const*, int, int);
+        bt_fn bt = (bt_fn)dlsym(nullptr, "backtrace");
+        btf_fn btf = (btf_fn)dlsym(nullptr, "backtrace_symbols_fd");
+        if (bt && btf) {
+            void* frames[48];
+            int cnt = bt(frames, 48);
+            if (cnt > 0)
+                btf(frames, cnt, 2); // stderr -> logcat crash buffer
+            char btl[64];
+            int bl = 0;
+            const char* bpre = "backtrace frames=";
+            for (const char* p = bpre; *p && bl < 50; ++p) btl[bl++] = *p;
+            int vv = cnt; char nb[16]; int mm = 0;
+            do { nb[mm++] = (char)('0' + (vv % 10)); vv /= 10; } while (vv && mm < 15);
+            for (int i = mm - 1; i >= 0 && bl < 60; --i) btl[bl++] = nb[i];
+            btl[bl] = 0;
+            __android_log_print(ANDROID_LOG_ERROR, "lsfg-wsi", "%s", btl);
+        }
+    } while (0);
+    // Chain to the previous handler (the Android/linker crash handler) so the
+    // full backtrace + tombstone is still produced.
+    if (sig < NSIG && s_prev_action[sig].sa_handler != SIG_DFL) {
+        if (s_prev_action[sig].sa_flags & SA_SIGINFO)
+            s_prev_action[sig].sa_sigaction(sig, info, ctx);
+        else
+            s_prev_action[sig].sa_handler(sig);
+        return;
+    }
+    // No previous handler: fall back to re-raising with the default.
     signal(sig, SIG_DFL);
     raise(sig);
 }
@@ -76,9 +116,10 @@ static void installCrashHandler() {
     sa.sa_sigaction = nativeCrashHandler;
     sa.sa_flags = SA_SIGINFO;
     sigemptyset(&sa.sa_mask);
-    sigaction(SIGSEGV, &sa, nullptr);
-    sigaction(SIGBUS,  &sa, nullptr);
-    sigaction(SIGABRT, &sa, nullptr);
+    // Save the previous handler for each signal so we can chain to it.
+    sigaction(SIGSEGV, &sa, &s_prev_action[SIGSEGV]);
+    sigaction(SIGBUS,  &sa, &s_prev_action[SIGBUS]);
+    sigaction(SIGABRT, &sa, &s_prev_action[SIGABRT]);
 }
 // --- end native crash diagnostics -------------------------------------------
 
@@ -128,6 +169,27 @@ namespace {
 
     Presenter g_presenter;
     std::mutex g_initLock;
+
+    // Per-AHardwareBuffer mutexes that serialize the producer's CPU fill
+    // (nativeFillAhb -> AHardwareBuffer_lock) against the presenter's GPU
+    // import/copy (importAhbLocked / transitionToGeneral / vkCmdCopyImage) of
+    // the SAME buffer.  Without this, the producer's AHardwareBuffer_lock races
+    // the presenter's Vulkan read of the same gralloc buffer; on the emulator's
+    // gralloc that double-closes an fd and fdsan aborts the present thread
+    // ("fdsan: attempted to close file descriptor 0", backtrace: nativeFillAhb
+    // -> AHardwareBuffer_lock -> Gralloc3Mapper::lock).  The presenter holds a
+    // buffer's lock until its present fence signals (GPU done reading it), so
+    // the producer cannot CPU-write a buffer the GPU is still reading.
+    std::map<uintptr_t, std::shared_ptr<std::mutex>> g_ahb_locks;
+    std::mutex g_ahb_locks_guard;
+    std::shared_ptr<std::mutex> getAhbLock(uintptr_t ahbKey) {
+        std::lock_guard<std::mutex> g(g_ahb_locks_guard);
+        auto it = g_ahb_locks.find(ahbKey);
+        if (it != g_ahb_locks.end()) return it->second;
+        auto m = std::make_shared<std::mutex>();
+        g_ahb_locks[ahbKey] = m;
+        return m;
+    }
 
     void stopPresenter() {
         if (!g_presenter.running) return;
@@ -377,6 +439,16 @@ namespace {
                 continue;
             }
             if (!g_presenter.surfaceValid) continue;
+
+            // Hold this frame's AHB lock for the whole GPU read (import + copy
+            // + submit + fence wait) so the producer thread cannot CPU-fill
+            // the same buffer while the GPU is reading it.  This fixes the
+            // fdsan "close file descriptor 0" abort (backtrace: nativeFillAhb
+            // -> AHardwareBuffer_lock -> Gralloc3Mapper::lock) seen on the
+            // KVM emulator's gralloc, a producer/consumer AHB race present in
+            // v1.6 and v1.7 (non-deterministic, ~1 in 4-5 test runs).
+            std::shared_ptr<std::mutex> ahbLock = getAhbLock(frame);
+            std::unique_lock<std::mutex> ahbGuard(*ahbLock);
 
             VkCommandBuffer cmdbuf = VK_NULL_HANDLE;
             try {
@@ -702,6 +774,11 @@ Java_com_lsfg_fork_wsi_WsiBridge_nativeFillAhb(
     AHardwareBuffer_Desc desc{};
     AHardwareBuffer_describe(ahb, &desc);
     if (desc.width == 0 || desc.height == 0) return;
+    // Serialize this CPU fill against the presenter's GPU read of the SAME
+    // buffer (see getAhbLock).  The producer must not AHardwareBuffer_lock a
+    // buffer the present thread is still importing/copying via Vulkan.
+    std::shared_ptr<std::mutex> ahbLock = getAhbLock(reinterpret_cast<uintptr_t>(ahb));
+    std::lock_guard<std::mutex> ahbGuard(*ahbLock);
     void* data = nullptr;
     AHardwareBuffer_lock(ahb, AHARDWAREBUFFER_USAGE_CPU_WRITE_RARELY,
                          /*fence*/ 0, /*rect*/ nullptr, &data);
@@ -734,3 +811,10 @@ Java_com_lsfg_fork_wsi_WsiBridge_nativeReleaseWindow(JNIEnv*, jclass, jlong wind
 }
 
 } // extern "C"
+
+extern "C" JNIEXPORT jint JNICALL JNI_OnLoad(JavaVM* vm, void* reserved) {
+    JNIEnv* env = nullptr;
+    if (vm->GetEnv((void**)&env, JNI_VERSION_1_6) == JNI_OK)
+        lsfgjlog::init(env, vm);
+    return JNI_VERSION_1_6;
+}

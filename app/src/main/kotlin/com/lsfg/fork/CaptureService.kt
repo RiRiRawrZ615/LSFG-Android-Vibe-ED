@@ -87,7 +87,20 @@ class CaptureService : Service() {
                 startForegroundSafely(buildIdleNotification("Waiting for screen capture consent..."))
                 Log.i(TAG, "ACTION_PREPARE: holding mediaProjection FGS for the consent picker")
             }
-            ACTION_START, null -> startSession()
+            ACTION_START -> startSession()
+            // CRITICAL FIX ("repeatedly loops and crashes"): on a null intent the
+            // system is restarting this START_STICKY service AFTER the process was
+            // killed (usually by a native crash).  The old code did
+            // `ACTION_START, null -> startSession()`, so every crash-triggered
+            // service restart immediately re-started the session -> beginSession
+            // -> crash -> service restart -> ... an infinite crash loop with no
+            // user input.  Now a null intent only re-asserts the foreground
+            // notification (keep-alive) and does NOT auto-start a session.  A
+            // session only starts on an explicit ACTION_START from the UI.
+            null -> {
+                Log.w(TAG, "onStartCommand null intent: service restarted (likely after a crash); NOT auto-starting session")
+                startForegroundSafely(buildIdleNotification("Idle. Press Start to begin."))
+            }
             ACTION_STOP -> stopSession()
             ACTION_TOGGLE -> {
                 if (session.isRunning()) stopSession() else startSession()

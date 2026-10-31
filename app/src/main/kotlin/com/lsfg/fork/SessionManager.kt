@@ -232,6 +232,10 @@ class SessionManager : ViewModel() {
             dstPool.add(
                 HardwareBuffer.create(
                     w, h, PixelFormat.RGBA_8888, 1,
+                    // Destination AHBs for generated frames.  Cross-device
+                    // sharing (framegen writes, WSI reads) is handled at the
+                    // Vulkan memory-type level (vkGetAndroidHardwareBufferProperties
+                    // intersection), so the AHB usage flag stays GPU_SAMPLED_IMAGE.
                     HardwareBuffer.USAGE_GPU_SAMPLED_IMAGE
                 )
             )

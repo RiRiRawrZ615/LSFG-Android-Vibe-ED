@@ -240,6 +240,46 @@ namespace {
         WLOG("swapchain created: %ux%u, %u images, format=%d", width, height, imageCount, (int)chosen.format);
     }
 
+    // One-time command buffer that transitions an imported source image from
+    // UNDEFINED -> GENERAL so it can be used as a vkCmdCopyImage SOURCE.  The
+    // imported AHB image is created with initialLayout UNDEFINED; reading it
+    // in UNDEFINED layout is undefined behavior and crashes some drivers.  We
+    // run this barrier once per image (right after import) and wait for it so
+    // presentLoop can safely read the image in GENERAL layout every frame.
+    void transitionToGeneral(VkImage image) {
+        VkCommandBufferAllocateInfo cabi{};
+        cabi.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
+        cabi.commandPool = g_presenter.cmdPool;
+        cabi.commandBufferCount = 1;
+        VkCommandBuffer cmdbuf = VK_NULL_HANDLE;
+        vkAllocateCommandBuffers(g_presenter.device, &cabi, &cmdbuf);
+        VkCommandBufferBeginInfo bci{};
+        bci.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+        bci.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+        vkBeginCommandBuffer(cmdbuf, &bci);
+        VkImageMemoryBarrier ib{};
+        ib.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+        ib.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+        ib.newLayout = VK_IMAGE_LAYOUT_GENERAL;
+        ib.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        ib.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        ib.srcAccessMask = 0;
+        ib.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+        ib.image = image;
+        ib.subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
+        vkCmdPipelineBarrier(cmdbuf, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                             0, 0, nullptr, 0, nullptr, 1, &ib);
+        vkEndCommandBuffer(cmdbuf);
+        VkSubmitInfo si{};
+        si.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+        si.commandBufferCount = 1;
+        si.pCommandBuffers = &cmdbuf;
+        vkQueueSubmit(g_presenter.queue, 1, &si, g_presenter.presentFence);
+        vkWaitForFences(g_presenter.device, 1, &g_presenter.presentFence, VK_TRUE, 5000000000ull);
+        vkResetFences(g_presenter.device, 1, &g_presenter.presentFence);
+        vkFreeCommandBuffers(g_presenter.device, g_presenter.cmdPool, 1, &cmdbuf);
+    }
+
     VkImage importAhbLocked(const void* ahb) {
         uintptr_t key = reinterpret_cast<uintptr_t>(ahb);
         auto it = g_presenter.ahbImages.find(key);
@@ -313,6 +353,15 @@ namespace {
         g_presenter.ahbImages[key] = image;
         g_presenter.ahbViews[key] = view;
         WLOG("imported AHB %p (%dx%d)", ahb, desc.width, desc.height);
+        // CRITICAL FIX: transition the imported image to GENERAL now (once),
+        // so presentLoop can read it as a copy source.  Reading an image in
+        // UNDEFINED layout (the old behavior) is undefined behavior and was
+        // crashing the process ~1.2-2.8s after beginSession.
+        try {
+            transitionToGeneral(image);
+        } catch (const std::exception& e) {
+            WLOGE("transitionToGeneral failed for %p: %s (continuing; may be OK on tolerant drivers)", ahb, e.what());
+        }
         return image;
     }
 
@@ -352,16 +401,39 @@ namespace {
                 }
                 if (ar != VK_SUCCESS) { WLOGE("acquire=%d", (int)ar); continue; }
 
-                vkResetCommandPool(g_presenter.device, g_presenter.cmdPool, 0);
+                // CRITICAL FIX (was the real ~1.2-2.8s crash): the old code
+                // (a) called vkResetCommandPool EVERY frame while the previous
+                // frame's command buffer was still allocated (spec violation: a
+                // command buffer must be freed before its pool is reset), and
+                // (b) NEVER freed the command buffer on the success path (the
+                // comment said "consumed by the GPU; don't free" - but a command
+                // buffer is NOT released by execution; it must be freed manually
+                // after the fence signals).  Together those leaked one command
+                // buffer per frame; once the pool exhausted, vkAllocateCommandBuffers
+                // failed, the code used a null buffer, and vkBeginCommandBuffer
+                // segfaulted.  Now: no per-frame reset (the pool is reset once in
+                // transitionToGeneral's fence flow and the command buffer is freed
+                // every frame after its fence, so the pool never accumulates).
                 VkCommandBufferAllocateInfo cabi{};
                 cabi.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
                 cabi.commandPool = g_presenter.cmdPool;
                 cabi.commandBufferCount = 1;
-                vkAllocateCommandBuffers(g_presenter.device, &cabi, &cmdbuf);
+                VkResult aRes = vkAllocateCommandBuffers(g_presenter.device, &cabi, &cmdbuf);
+                if (aRes != VK_SUCCESS) {
+                    WLOGE("vkAllocateCommandBuffers=%d", (int)aRes);
+                    std::this_thread::sleep_for(2ms);
+                    continue;
+                }
                 VkCommandBufferBeginInfo bci{};
                 bci.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
                 bci.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
-                vkBeginCommandBuffer(cmdbuf, &bci);
+                VkResult bRes = vkBeginCommandBuffer(cmdbuf, &bci);
+                if (bRes != VK_SUCCESS) {
+                    WLOGE("vkBeginCommandBuffer=%d", (int)bRes);
+                    vkFreeCommandBuffers(g_presenter.device, g_presenter.cmdPool, 1, &cmdbuf);
+                    cmdbuf = VK_NULL_HANDLE;
+                    continue;
+                }
 
                 VkImageMemoryBarrier ib{};
                 ib.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
@@ -378,12 +450,21 @@ namespace {
                 AHardwareBuffer_Desc desc{};
                 AHardwareBuffer_describe(const_cast<AHardwareBuffer*>(reinterpret_cast<const AHardwareBuffer*>(frame)), &desc);
 
+                // CRITICAL FIX: clamp the copy extent to the MIN of the source
+                // AHB and the swapchain image.  The old code used the AHB extent
+                // (full resolution) unconditionally; when the AHB is larger than
+                // the swapchain image (rotation / resolution change) vkCmdCopyImage
+                // reads out of bounds -> driver crash.
+                uint32_t cw = g_presenter.width;
+                uint32_t ch = g_presenter.height;
+                uint32_t cx = std::min(desc.width, cw);
+                uint32_t cy = std::min(desc.height, ch);
                 VkImageCopy region{};
                 region.srcSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 };
                 region.dstSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 };
                 region.srcOffset = { 0, 0, 0 };
                 region.dstOffset = { 0, 0, 0 };
-                region.extent = { desc.width, desc.height, 1 };
+                region.extent = { cx, cy, 1 };
                 vkCmdCopyImage(cmdbuf, srcImage, VK_IMAGE_LAYOUT_GENERAL,
                     g_presenter.swapchainImages[imageIndex], VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region);
 
@@ -433,12 +514,21 @@ namespace {
                 // before reusing any of its resources on the next iteration.
                 VkResult wr = vkWaitForFences(g_presenter.device, 1, &g_presenter.presentFence, VK_TRUE, 3000000000ull);
                 if (wr == VK_SUCCESS) vkResetFences(g_presenter.device, 1, &g_presenter.presentFence);
-                cmdbuf = VK_NULL_HANDLE; // consumed by the GPU; don't free
+                // CRITICAL FIX: free the command buffer NOW that its fence has
+                // signaled (the GPU is done with it).  The old code set
+                // cmdbuf = VK_NULL_HANDLE and never freed it -> per-frame leak
+                // -> pool exhaustion -> null-buffer segfault after ~1.2-2.8s.
+                vkFreeCommandBuffers(g_presenter.device, g_presenter.cmdPool, 1, &cmdbuf);
+                cmdbuf = VK_NULL_HANDLE;
                 g_presenter.framesPresented++;
             } catch (const std::exception& e) {
                 WLOGE("present loop: %s", e.what());
                 std::this_thread::sleep_for(10ms);
             }
+            // Free the command buffer on any early-exit path (acquire timeout,
+            // swapchain recreate, submit failure, exception) so it is never
+            // leaked.  The success path already freed it above, so cmdbuf is
+            // VK_NULL_HANDLE there and this is a no-op.
             if (cmdbuf) vkFreeCommandBuffers(g_presenter.device, g_presenter.cmdPool, 1, &cmdbuf);
         }
     }

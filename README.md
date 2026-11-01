@@ -19,7 +19,7 @@
 
 ### Capture modes (implemented)
 1. **Non-root** — MediaProjection + VirtualDisplay + ImageReader (scrcpy-style). One-time system consent.
-2. **Shizuku** — privileged shell `screencap`.
+2. **Shizuku** — shell `screencap` with base64 read-back (does not use the Shizuku ScreenCapture API).
 3. **Root** — root shell `screencap` (KernelSU / Magisk). Highest performance.
 
 ### Overlay

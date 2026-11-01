@@ -362,16 +362,22 @@ Pipeline& Context::pipeline() {
 }
 
 Instance::~Instance() {
-    if (!this->m_impl->vk.leakInstance)
+    // Destroy the Vulkan device and instance unless leakInstance is set.
+    // (The member unique_ptrs would tear down in reverse declaration order,
+    // which is wrong for Vulkan: device must be destroyed before instance.)
+    if (this->m_impl->vk.leakInstance)
         return;
 
     try {
-        new std::unique_ptr<vk::detail::DispatchLoaderDynamic>(std::move(this->m_impl->vk.dld));
-        new vk::UniqueDevice(std::move(this->m_impl->vk.device));
-        new vk::UniqueInstance(std::move(this->m_impl->vk.instance));
+        // Shader modules are device objects and must be destroyed first.
+        this->m_impl->shaderLibrary.destroy();
+        if (this->m_impl->vk.device)
+            this->m_impl->vk.device->destroy(nullptr, *this->m_impl->vk.dld);
+        if (this->m_impl->vk.instance)
+            this->m_impl->vk.instance->destroy(nullptr, *this->m_impl->vk.dld);
     } catch (...) {
         if (!this->m_impl->logCallback)
             return;
-        this->m_impl->logCallback("Failed to leak Vulkan instance and device");
+        this->m_impl->logCallback("Failed to destroy Vulkan instance and device");
     }
 }

@@ -274,7 +274,7 @@ class SessionManager : ViewModel() {
             }
         }
         val frameSink: (HardwareBuffer, Long) -> Int = { srcAhb, srcAhbPtr ->
-            driveFramegen(srcAhb, srcAhbPtr, s.multiplier)
+            driveFramegen(srcAhb, srcAhbPtr, _state.value.multiplier)
         }
 
         if (s.testPattern) {
@@ -450,6 +450,9 @@ class SessionManager : ViewModel() {
 
     private fun setupFramegen(w: Int, h: Int, s: State, dllPath: String): Boolean {
         return try {
+            // Performance mode selects the half-precision shader variants from the
+            // DLL; it must match at init time (the shader modules are compiled
+            // once per instance), so re-initialize whenever it changes.
             val okInit = FramegenBridge.init(dllPath, allowFP16 = s.performance)
             if (!okInit) {
                 Log.e(TAG, "framegen init FAILED for $dllPath")

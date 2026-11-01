@@ -90,6 +90,17 @@ class CaptureEngine(
         )
     }
 
+    /**
+     * Release the Java reference to a source AHB once the frame has been
+     * consumed (framegen blit complete / pushed to the presenter). The native
+     * side holds its own AHardwareBuffer ref until the GPU is done with it, so
+     * closing the Java object here is safe and stops the per-frame native
+     * buffer leak (each captured frame allocated a fresh AHB).
+     */
+    private fun releaseSource(ahb: HardwareBuffer) {
+        try { ahb.close() } catch (_: Throwable) {}
+    }
+
     fun start() {
         synchronized(lock) {
             if (running) return
@@ -130,10 +141,12 @@ class CaptureEngine(
                             frames++
                             latencySum += System.currentTimeMillis() - t0
                             consecutiveErrors = 0
+                            releaseSource(ahb)
                         } else {
                             // Capture-by-any-means: if MediaProjection produced
                             // nothing this cycle and we have a root fallback,
                             // use a root screencap so the session still gets frames.
+                            var fallbackUsed = false
                             if (mode == "nonroot" && rootFallback) {
                                 val fb = captureRootFallback()
                                 if (fb != null) {
@@ -145,11 +158,13 @@ class CaptureEngine(
                                     if (produced <= 0 && ahbPtr != 0L) WsiBridge.nativePushFrame(ahbPtr)
                                     lastFrameSource = "root-fallback"
                                     frames++
+                                    latencySum += System.currentTimeMillis() - t0
                                     consecutiveErrors = 0
-                                    continue
+                                    releaseSource(fb)
+                                    fallbackUsed = true
                                 }
                             }
-                            if (mode == "nonroot") {
+                            if (!fallbackUsed && mode == "nonroot") {
                                 Thread.sleep(4)
                             }
                         }

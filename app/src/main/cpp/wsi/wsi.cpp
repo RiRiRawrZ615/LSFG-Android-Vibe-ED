@@ -232,28 +232,44 @@ namespace {
     // initialized state from a failed startup as well as a full session.
     //
     // gpuFailure means a submitted command buffer's completion was never
-    // confirmed (fence timeout / device loss). vkDeviceWaitIdle cannot be
-    // trusted to establish GPU quiescence in that state, so the pending command
-    // buffer and its imported frame are intentionally NOT freed: they are
-    // abandoned with the device and reclaimed by the process. This is a
-    // bounded, documented leak on an unrecoverable GPU stall, preferred over
-    // freeing resources the GPU may still be using (use-after-free) or
-    // destroying a device with an active command buffer (undefined behavior).
+    // confirmed (fence timeout / device loss) or the device could not be
+    // brought to idle. In that state destroying ANY part of the Vulkan
+    // ownership hierarchy is invalid: the pending command buffer may still be
+    // executing, so its command pool, fence, swapchain, imported image/memory
+    // and the device/instance itself must not be destroyed (and destroying the
+    // device would dangle every retained child handle). The entire hierarchy is
+    // therefore retained and leaked until process exit, where the OS reclaims
+    // it. This is a bounded, documented terminal-failure leak, preferred over
+    // use-after-free or undefined behavior. Normal shutdown (gpuFailure false)
+    // destroys everything.
     static void teardownVulkanResources() {
-        bool gpuFailure = g_presenter.gpuFailure;
-        if (!gpuFailure) {
-            // The device is idle, so no GPU operation is still using the
-            // cached imports or the pending command buffer.
-            for (auto& [key, imp] : g_presenter.ahbImports)
-                destroyAhbImport(imp);
+        if (g_presenter.gpuFailure) {
+            WLOGE("GPU failure: retaining Vulkan device/instance, pool, fence, swapchain, "
+                   "%zu import(s) and pending command buffer until process exit",
+                   g_presenter.ahbImports.size());
             g_presenter.ahbImports.clear();
-            if (g_presenter.pendingCmdbuf) {
-                vkFreeCommandBuffers(g_presenter.device, g_presenter.cmdPool, 1, &g_presenter.pendingCmdbuf);
-                g_presenter.pendingCmdbuf = VK_NULL_HANDLE;
-            }
-        } else {
-            WLOGE("GPU failure: abandoning %zu import(s) and pending command buffer "
-                   "with the device (completion unconfirmed)", g_presenter.ahbImports.size());
+            g_presenter.pendingCmdbuf = VK_NULL_HANDLE;
+            g_presenter.swapchainCount = 0;
+            g_presenter.swapchain = VK_NULL_HANDLE;
+            g_presenter.cmdPool = VK_NULL_HANDLE;
+            g_presenter.presentFence = VK_NULL_HANDLE;
+            g_presenter.imageAcquired = VK_NULL_HANDLE;
+            g_presenter.frameReady = VK_NULL_HANDLE;
+            g_presenter.device = VK_NULL_HANDLE;
+            g_presenter.surface = VK_NULL_HANDLE;
+            g_presenter.instance = VK_NULL_HANDLE;
+            g_presenter.physdev = VK_NULL_HANDLE;
+            g_presenter.queue = VK_NULL_HANDLE;
+            return;
+        }
+        // Normal shutdown: the device is idle, so no GPU operation is still
+        // using the cached imports or any command buffer.
+        for (auto& [key, imp] : g_presenter.ahbImports)
+            destroyAhbImport(imp);
+        g_presenter.ahbImports.clear();
+        if (g_presenter.pendingCmdbuf) {
+            vkFreeCommandBuffers(g_presenter.device, g_presenter.cmdPool, 1, &g_presenter.pendingCmdbuf);
+            g_presenter.pendingCmdbuf = VK_NULL_HANDLE;
         }
         for (uint32_t i = 0; i < g_presenter.swapchainCount; i++) {
             if (g_presenter.swapchainViews[i])
@@ -301,8 +317,17 @@ namespace {
         g_presenter.paused = false;
         lsfgdisplay::clear();
         if (g_presenter.instance || g_presenter.device) {
-            if (!g_presenter.gpuFailure)
-                vkDeviceWaitIdle(g_presenter.device);
+            if (!g_presenter.gpuFailure) {
+                // vkDeviceWaitIdle establishes that no GPU work is outstanding,
+                // which is what makes the destruction below legal. A failure
+                // here means completion could not be confirmed, so switch to
+                // the terminal-failure retention path instead of destroying
+                // resources the GPU may still be using.
+                if (vkDeviceWaitIdle(g_presenter.device) != VK_SUCCESS) {
+                    WLOGE("vkDeviceWaitIdle failed; retaining Vulkan resources (terminal failure)");
+                    g_presenter.gpuFailure = true;
+                }
+            }
             teardownVulkanResources();
         }
         g_presenter.framesPresented = 0;
@@ -481,6 +506,24 @@ namespace {
             default: break;
         }
 
+        // Resources created below are owned by this function until the import
+        // is recorded in ahbImports. If any step fails BEFORE that, everything
+        // created so far is destroyed here (no GPU work references it yet).
+        // Once recorded, ownership moves to ahbImports and no cleanup runs.
+        VkImage image = VK_NULL_HANDLE;
+        VkDeviceMemory mem = VK_NULL_HANDLE;
+        VkImageView view = VK_NULL_HANDLE;
+        bool recorded = false;
+        struct Cleanup {
+            VkImage image; VkDeviceMemory mem; VkImageView view; bool recorded;
+            ~Cleanup() {
+                if (recorded) return;
+                if (view) vkDestroyImageView(g_presenter.device, view, nullptr);
+                if (image) vkDestroyImage(g_presenter.device, image, nullptr);
+                if (mem) vkFreeMemory(g_presenter.device, mem, nullptr);
+            }
+        } guard{image, mem, view, recorded};
+
         VkImageCreateInfo ici{};
         ici.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
         ici.imageType = VK_IMAGE_TYPE_2D;
@@ -493,8 +536,8 @@ namespace {
         ici.usage = VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
         ici.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
 
-        VkImage image = VK_NULL_HANDLE;
         VK_CHECK(vkCreateImage(g_presenter.device, &ici, nullptr, &image));
+        guard.image = image;
 
         VkAndroidHardwareBufferPropertiesANDROID props{};
         props.sType = VK_STRUCTURE_TYPE_ANDROID_HARDWARE_BUFFER_PROPERTIES_ANDROID;
@@ -519,8 +562,8 @@ namespace {
         mai.pNext = &importInfo;
         mai.allocationSize = mreq.size;
         mai.memoryTypeIndex = memTypeIndex;
-        VkDeviceMemory mem = VK_NULL_HANDLE;
         VK_CHECK(vkAllocateMemory(g_presenter.device, &mai, nullptr, &mem));
+        guard.mem = mem;
         VK_CHECK(vkBindImageMemory(g_presenter.device, image, mem, 0));
 
         VkImageViewCreateInfo vci{};
@@ -529,22 +572,30 @@ namespace {
         vci.viewType = VK_IMAGE_VIEW_TYPE_2D;
         vci.format = fmt;
         vci.subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
-        VkImageView view = VK_NULL_HANDLE;
         VK_CHECK(vkCreateImageView(g_presenter.device, &vci, nullptr, &view));
+        guard.view = view;
 
         Presenter::AhbImport imp;
         imp.image = image;
         imp.view = view;
         imp.memory = mem;
         g_presenter.ahbImports[key] = imp;
+        guard.recorded = true;  // ownership transferred to ahbImports
         WLOG("imported AHB %p (%dx%d)", ahb, desc.width, desc.height);
         // CRITICAL FIX: transition the imported image to GENERAL now (once),
         // so presentLoop can read it as a copy source.  Reading an image in
         // UNDEFINED layout (the old behavior) is undefined behavior and was
         // crashing the process ~1.2-2.8s after beginSession.
-        // The image was only just created, so an unconfirmed transition cannot
-        // race any other GPU use of it; destroy the import and propagate the
-        // failure instead of reading the image in UNDEFINED layout.
+        //
+        // Failure semantics:
+        // - submit failed / pre-GPU failure: nothing was queued, the import is
+        //   safe to destroy; the exception propagates and presentLoop's
+        //   releasePoppedFrame destroys it (gpuFailure is not set).
+        // - fence timeout / device loss: transitionToGeneral records the
+        //   command buffer as pending and sets gpuFailure; the import stays in
+        //   ahbImports and is retained by the terminal-failure teardown (the
+        //   GPU may still be transitioning it), so it must NOT be destroyed
+        //   here or by releasePoppedFrame.
         transitionToGeneral(image);
         return image;
     }

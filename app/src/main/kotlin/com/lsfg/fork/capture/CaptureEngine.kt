@@ -122,6 +122,7 @@ class CaptureEngine(
                     try {
                         val ahb = captureOnce()
                         if (ahb != null) {
+                            PipelineStats.incAcquired()
                             val ahbPtr = WsiBridge.nativeAhbPtr(ahb)
                             val sink = frameSink
                             val produced = if (sink != null) {
@@ -129,6 +130,7 @@ class CaptureEngine(
                                     sink(ahb, ahbPtr)
                                 } catch (t: Throwable) {
                                     lastError = t.message ?: "framegen failed"
+                                    PipelineStats.incErrors()
                                     Log.w("CaptureEngine", "frameSink: $lastError")
                                     0
                                 }
@@ -137,6 +139,7 @@ class CaptureEngine(
                             if (produced <= 0 && ahbPtr != 0L) {
                                 // Passthrough (framegen off / unavailable): present source.
                                 WsiBridge.nativePushFrame(ahbPtr)
+                                PipelineStats.incSubmitted()
                             }
                             frames++
                             latencySum += System.currentTimeMillis() - t0
@@ -150,12 +153,16 @@ class CaptureEngine(
                             if (mode == "nonroot" && rootFallback) {
                                 val fb = captureRootFallback()
                                 if (fb != null) {
+                                    PipelineStats.incAcquired()
                                     val ahbPtr = WsiBridge.nativeAhbPtr(fb)
                                     val sink = frameSink
                                     val produced = if (sink != null) {
-                                        try { sink(fb, ahbPtr) } catch (t: Throwable) { lastError = t.message; 0 }
+                                        try { sink(fb, ahbPtr) } catch (t: Throwable) { lastError = t.message; PipelineStats.incErrors(); 0 }
                                     } else 0
-                                    if (produced <= 0 && ahbPtr != 0L) WsiBridge.nativePushFrame(ahbPtr)
+                                    if (produced <= 0 && ahbPtr != 0L) {
+                                        WsiBridge.nativePushFrame(ahbPtr)
+                                        PipelineStats.incSubmitted()
+                                    }
                                     lastFrameSource = "root-fallback"
                                     frames++
                                     latencySum += System.currentTimeMillis() - t0
@@ -170,6 +177,7 @@ class CaptureEngine(
                         }
                     } catch (t: Throwable) {
                         lastError = t.message ?: "capture failed"
+                        PipelineStats.incErrors()
                         consecutiveErrors++
                         if (consecutiveErrors in listOf(1, 5, 20) || consecutiveErrors % 25 == 0) {
                             Log.w("CaptureEngine", "capture error #$consecutiveErrors: $lastError")

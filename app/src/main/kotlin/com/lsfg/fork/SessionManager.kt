@@ -9,8 +9,10 @@ import android.os.Build
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
 import com.lsfg.fork.capture.CaptureEngine
+import com.lsfg.fork.capture.PipelineStats
 import com.lsfg.fork.capture.RootCaptureEngineAdapter
 import com.lsfg.fork.capture.ShizukuCaptureEngineAdapter
+import com.lsfg.fork.capture.reportPipelineStats
 import com.lsfg.fork.framegen.FramegenBridge
 import com.lsfg.fork.session.NativeBridge
 import com.lsfg.fork.testpattern.TestPattern
@@ -94,6 +96,7 @@ class SessionManager : ViewModel() {
     private var shizukuCapture: ShizukuCaptureEngineAdapter? = null
     private var testPattern: TestPattern? = null
     private var testThread: Thread? = null
+    private var sessionStatsThread: Thread? = null
     @Volatile private var windowPtr: Long = 0L
     @Volatile private var mediaProjection: MediaProjection? = null
 
@@ -261,11 +264,17 @@ class SessionManager : ViewModel() {
         // 4. Frame source: built-in test pattern OR capture engine.
         // Privileged (root/shizuku) engines feed frames through NativeBridge;
         // wire the session sink (framegen drive or passthrough) before start.
+        PipelineStats.reset()
         NativeBridge.sessionFrameSink = { hb ->
             val ptr = WsiBridge.nativeAhbPtr(hb)
             if (framegenSessionOk && ptr != 0L) driveFramegen(hb, ptr, _state.value.multiplier)
-            else if (ptr != 0L) WsiBridge.nativePushFrame(ptr)
-            else 0
+            else if (ptr != 0L) {
+                WsiBridge.nativePushFrame(ptr)
+                PipelineStats.incSubmitted()
+            } else {
+                PipelineStats.incDropped()
+                0
+            }
         }
         val onStats = { fps: Float, lat: Float, err: String? ->
             // Honest health check: the session is only "OK" if the presenter
@@ -290,6 +299,7 @@ class SessionManager : ViewModel() {
             driveFramegen(srcAhb, srcAhbPtr, _state.value.multiplier)
         }
 
+        var usedPrivileged = false
         if (s.testPattern) {
             val pattern = TestPattern(w, h)
             testPattern = pattern
@@ -304,14 +314,16 @@ class SessionManager : ViewModel() {
                     try {
                         val ahb = pattern.next()
                         if (ahb != null) {
+                            PipelineStats.incAcquired()
                             val ptr = WsiBridge.nativeAhbPtr(ahb)
                             if (framegenSessionOk) {
                                 val produced = driveFramegen(ahb, ptr, _state.value.multiplier)
                                 if (produced > 0) ok++
                             } else if (ptr != 0L) {
                                 WsiBridge.nativePushFrame(ptr)
+                                PipelineStats.incSubmitted()
                                 ok++
-                            }
+                            } else PipelineStats.incDropped()
                         }
                     } catch (t: Throwable) {
                         Log.w(TAG, "testpattern frame failed: ${t.message}")
@@ -342,7 +354,6 @@ class SessionManager : ViewModel() {
             // If the privileged backend is not ready (no root grant / Shizuku
             // not running), fall back to the legacy screencap/MediaProjection
             // paths so the session still starts.
-            var usedPrivileged = false
             if (mode == "root") {
                 val adapter = RootCaptureEngineAdapter(appContext)
                 if (adapter.isReady()) {
@@ -402,6 +413,10 @@ class SessionManager : ViewModel() {
             Log.i(TAG, "beginSession: capture engine started (mode=$mode rootFallback=${eng.rootFallback})")
             }
         }
+
+        // Per-second pipeline telemetry for modes without an adapter stats
+        // loop (test pattern, nonroot/MediaProjection, root screencap fallback).
+        startSessionStatsReporter(s.testPattern || !usedPrivileged)
 
         if (framegenSessionOk) {
             _state.update { it.copy(statusMsg = "running: ${s.captureMode} -> LSFG v3.1 -> overlay") }
@@ -534,11 +549,34 @@ class SessionManager : ViewModel() {
             if (dstPtr == 0L) return@repeat
             FramegenBridge.acquireToDst(dstPtr)
             WsiBridge.nativePushFrame(dstPtr)
+            PipelineStats.incGenerated()
             dstPoolIdx++
             produced++
         }
         capturedFrameIdx++
         return produced
+    }
+
+    /**
+     * Per-second pipeline telemetry for session modes that don't run an
+     * adapter stats loop (test pattern, nonroot/MediaProjection). The
+     * root/shizuku adapters log their own pipeline line, so this is skipped
+     * for privileged capture.
+     */
+    private fun startSessionStatsReporter(active: Boolean) {
+        stopSessionStatsReporter()
+        if (!active) return
+        sessionStatsThread = thread(name = "lsfg-session-stats", isDaemon = true) {
+            while (_state.value.running) {
+                try { Thread.sleep(1000L) } catch (_: InterruptedException) { break }
+                reportPipelineStats("lsfg-session")
+            }
+        }
+    }
+
+    private fun stopSessionStatsReporter() {
+        try { sessionStatsThread?.interrupt() } catch (_: Throwable) {}
+        sessionStatsThread = null
     }
 
     private fun setupFramegen(w: Int, h: Int, s: State, dllPath: String, appContext: Context): Boolean {
@@ -618,6 +656,7 @@ class SessionManager : ViewModel() {
     fun endSession() {
         if (!_state.value.running) return
         Log.i(TAG, "endSession")
+        stopSessionStatsReporter()
         try { testThread?.interrupt() } catch (_: Throwable) {}
         testThread = null
         try { testPattern?.stop() } catch (_: Throwable) {}

@@ -13,12 +13,22 @@
 
 #include <atomic>
 #include <cstdint>
+#include <cstdio>
 #include <memory>
 #include <mutex>
 #include <stdexcept>
 #include <string>
 #include <unordered_map>
 #include <vk>
+
+// Pipeline telemetry (framegen side). These count actual GPU operations, not
+// configured targets: srcWritten = source AHBs blitted into the pipeline input;
+// dispatches = pipeline dispatches submitted; framesAcquired = generated frames
+// blitted into destination AHBs. Logged on destroy and exposed to Kotlin via
+// nativeGetStats so the per-second pipeline report shows real generated rates.
+std::atomic<uint64_t> g_fgSrcWritten{0};
+std::atomic<uint64_t> g_fgDispatches{0};
+std::atomic<uint64_t> g_fgFramesAcquired{0};
 
 #define LOG_TAG "lsfg-framegen"
 #define FLOG(...) lsfgjlog::logprintf(ANDROID_LOG_INFO, LOG_TAG, __VA_ARGS__)
@@ -346,6 +356,7 @@ Java_com_lsfg_fork_framegen_FramegenBridge_nativeWriteSource(
         const void* src = reinterpret_cast<const void*>(srcAhbPtr);
         const uint32_t layer = static_cast<uint32_t>(slot) % 2;
         writeSourceLayer(*st, src, layer);
+        g_fgSrcWritten++;
     } catch (const std::exception& e) {
         FLOGE("nativeWriteSource failed: %s", e.what());
     }
@@ -358,6 +369,7 @@ Java_com_lsfg_fork_framegen_FramegenBridge_nativeDispatch(
     if (!st || !st->context) return;
     try {
         st->context->dispatch(static_cast<uint32_t>(total));
+        g_fgDispatches++;
     } catch (const std::exception& e) {
         FLOGE("nativeDispatch failed: %s", e.what());
     }
@@ -393,6 +405,7 @@ Java_com_lsfg_fork_framegen_FramegenBridge_nativeAcquireToDst(
         // recording the blit on first use for this buffer), synchronously.
         auto blit = ensureDstBlit(*st, dst);
         submitAndWait(*st, blit);
+        g_fgFramesAcquired++;
     } catch (const std::exception& e) {
         FLOGE("nativeAcquireToDst failed: %s", e.what());
     }
@@ -425,7 +438,24 @@ Java_com_lsfg_fork_framegen_FramegenBridge_nativeDestroy(
     if (st->blitFence) st->device.destroyFence(st->blitFence, nullptr, dld);
     if (st->blitPool) st->device.destroyCommandPool(st->blitPool, nullptr, dld);
     st->instance.reset();
+    FLOG("framegen session stats: srcWritten=%llu dispatches=%llu framesAcquired=%llu",
+        (unsigned long long)g_fgSrcWritten.load(),
+        (unsigned long long)g_fgDispatches.load(),
+        (unsigned long long)g_fgFramesAcquired.load());
     delete st;
+}
+
+/// Pipeline telemetry snapshot for the per-second Kotlin stats report.
+/// Returns "srcWritten,dispatches,framesAcquired" so generated-fps can be
+/// computed from real GPU operation counts, not assumed multipliers.
+JNIEXPORT jstring JNICALL
+Java_com_lsfg_fork_framegen_FramegenBridge_nativeGetStats(JNIEnv* env, jclass) {
+    char buf[96];
+    snprintf(buf, sizeof(buf), "%llu,%llu,%llu",
+        (unsigned long long)g_fgSrcWritten.load(),
+        (unsigned long long)g_fgDispatches.load(),
+        (unsigned long long)g_fgFramesAcquired.load());
+    return env->NewStringUTF(buf);
 }
 
 } // extern "C"

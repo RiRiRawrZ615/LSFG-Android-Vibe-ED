@@ -17,6 +17,9 @@ object FramegenBridge {
     private external fun nativeIdle(handle: Long)
     private external fun nativeDestroy(handle: Long)
 
+    /** "srcWritten,dispatches,framesAcquired" — real GPU operation counters. */
+    private external fun nativeGetStats(): String
+
     init {
         try {
             System.loadLibrary("lsfg_framegen")
@@ -97,5 +100,20 @@ object FramegenBridge {
         try { nativeDestroy(instance) } catch (_: Throwable) {}
         instance = 0L
         loaded = false
+    }
+
+    /**
+     * Framegen GPU operation counters as "srcWritten,dispatches,framesAcquired".
+     * Used by the pipeline stats report to show real generated-frame rates.
+     * Returns "0,0,0" when the native lib is not loaded.
+     */
+    fun getStats(): Triple<Long, Long, Long> {
+        if (instance == 0L) return Triple(0L, 0L, 0L)
+        return try {
+            val p = nativeGetStats().split(',')
+            Triple(p[0].toLong(), p[1].toLong(), p[2].toLong())
+        } catch (_: Throwable) {
+            Triple(0L, 0L, 0L)
+        }
     }
 }

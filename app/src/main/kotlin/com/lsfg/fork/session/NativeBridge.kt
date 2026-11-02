@@ -1,6 +1,7 @@
 package com.lsfg.fork.session
 
 import android.hardware.HardwareBuffer
+import com.lsfg.fork.capture.PipelineStats
 import com.lsfg.fork.wsi.WsiBridge
 
 /**
@@ -30,17 +31,22 @@ object NativeBridge {
         if (sink != null) {
             try {
                 sink(hardwareBuffer)
+                PipelineStats.incSubmitted()
                 return
             } catch (t: Throwable) {
+                PipelineStats.incDropped()
+                PipelineStats.incErrors()
                 LsfgLog.w(TAG, "sessionFrameSink threw: ${t.message}")
             }
         }
         val ptr = WsiBridge.nativeAhbPtr(hardwareBuffer)
         if (ptr == 0L) {
+            PipelineStats.incDropped()
             LsfgLog.w(TAG, "pushFrame: AHB ptr == 0 (${hardwareBuffer.width}x${hardwareBuffer.height})")
             return
         }
         WsiBridge.nativePushFrame(ptr)
+        PipelineStats.incSubmitted()
     }
 
     /**

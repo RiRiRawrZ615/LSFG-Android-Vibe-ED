@@ -13,6 +13,7 @@ import android.os.SystemClock
 import com.lsfg.fork.shizuku.IShizukuCaptureService
 import com.lsfg.fork.shizuku.IShizukuFrameCallback
 import com.lsfg.fork.capture.CaptureEngine
+import com.lsfg.fork.capture.PipelineStats
 import com.topjohnwu.superuser.Shell
 import com.topjohnwu.superuser.ipc.RootService
 
@@ -43,6 +44,8 @@ class RootCaptureEngine(private val ctx: Context) {
     private var graphRealEma: Float = 0f
     private var graphGenEma: Float = 0f
     @Volatile private var everConnected: Boolean = false
+    @Volatile var framesReceived: Long = 0L
+        private set
 
     private val connection = object : ServiceConnection {
         override fun onServiceConnected(name: ComponentName, binder: IBinder?) {
@@ -68,6 +71,9 @@ class RootCaptureEngine(private val ctx: Context) {
     fun setFrameGraphListener(listener: CaptureEngine.FrameGraphListener?) { graphListener = listener }
 
     fun isReady(): Boolean = Shell.isAppGrantedRoot() == true
+
+    /** True once the RootService bound AND a capture session was started. */
+    fun isCaptureActive(): Boolean = everConnected && service != null
 
     fun startCapture(targetPackage: String, width: Int, height: Int, maxFps: Int) {
         metricsOnly = false
@@ -241,16 +247,21 @@ class RootCaptureEngine(private val ctx: Context) {
         override fun onFrame(buffer: HardwareBuffer, timestampNs: Long) {
             fpsFrameCount++
             graphFrameCount++
-            try {
-                if (!metricsOnly) NativeBridge.pushFrame(buffer, timestampNs)
-            } catch (t: Throwable) {
-                LsfgLog.w(TAG, "pushFrame from root failed", t)
-            } finally {
-                runCatching { buffer.close() }
+            framesReceived++
+            if (!metricsOnly) {
+                PipelineStats.incAcquired()
+                try {
+                    NativeBridge.pushFrame(buffer, timestampNs)
+                } catch (t: Throwable) {
+                    PipelineStats.incErrors()
+                    LsfgLog.w(TAG, "pushFrame from root failed", t)
+                }
             }
+            runCatching { buffer.close() }
         }
 
         override fun onError(message: String?) {
+            PipelineStats.incErrors()
             errorListener?.onError(message ?: "Unknown root capture error")
         }
 

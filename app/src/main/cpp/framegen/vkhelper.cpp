@@ -156,26 +156,56 @@ vk::UniqueShaderModule vkhelper::createShaderModule(
 }
 
 namespace {
-    /// Find the cache file path
+    // Base directory for pipeline cache files.
+    //
+    // Path policy (Android-first, per project rule "never use /tmp/"):
+    //   1) explicit dir set by the host app via setPipelineCacheDir()
+    //      (app internal files/lsfg-cache, always writable, no permissions)
+    //   2) XDG_CACHE_HOME (desktop)
+    //   3) $HOME/.cache (desktop)
+    //   4) /tmp/lsfg-vk last resort (Linux desktop only; on HyperOS /tmp is a
+    //      read-only tmpfs, so creating dirs there throws)
+    // Any failure to create the directory degrades to in-memory-only cache
+    // (returns an empty path) instead of aborting session creation.
+    std::string g_pipelineCacheBase{};
+
+    /// Find the cache file path. Returns an empty path when no usable cache
+    /// directory could be established (caller must then skip file I/O).
     std::filesystem::path findPipelineCache(
         const vk::detail::DispatchLoaderDynamic& dld,
         const vk::PhysicalDevice& physdev,
         std::string_view tag
     ) {
-        // First find the base path
-        std::filesystem::path path{"/tmp/lsfg-vk"};
+        std::filesystem::path base;
+        if (!g_pipelineCacheBase.empty())
+            base = std::filesystem::path{g_pipelineCacheBase};
+        else {
+            const char* xdgCacheHome{std::getenv("XDG_CACHE_HOME")};
+            if (xdgCacheHome && *xdgCacheHome != '\0')
+                base = std::filesystem::path(xdgCacheHome) / "lsfg-vk";
+            else {
+                const char* home{std::getenv("HOME")};
+                if (home && *home != '\0')
+                    base = std::filesystem::path(home) / ".cache" / "lsfg-vk";
+                else
+                    base = std::filesystem::path{"/tmp/lsfg-vk"};
+            }
+        }
 
-        const char* home{std::getenv("HOME")};
-        if (home && *home != '\0')
-            path = std::filesystem::path(home) / ".cache" / "lsfg-vk";
-
-        const char* xdgCacheHome{std::getenv("XDG_CACHE_HOME")};
-        if (xdgCacheHome && *xdgCacheHome != '\0')
-            path = std::filesystem::path(xdgCacheHome) / "lsfg-vk";
-
-        // Ensure the directory exists
-        if (!std::filesystem::exists(path))
-            std::filesystem::create_directories(path);
+        // Ensure the directory exists (best-effort: a read-only /tmp on some
+        // Android builds must not kill session creation).
+        std::error_code ec{};
+        if (!std::filesystem::exists(base, ec) && ec) {
+            if (!g_pipelineCacheBase.empty())
+                base = std::filesystem::path{""}; // explicit dir but unwritable: go in-memory
+        }
+        if (!base.empty() && !std::filesystem::exists(base)) {
+            try {
+                std::filesystem::create_directories(base);
+            } catch (const std::exception&) {
+                base = std::filesystem::path{""};
+            }
+        }
 
         // Calculate the physical device UUID
         const auto info{physdev.getProperties(dld)};
@@ -189,10 +219,16 @@ namespace {
             }
         }
 
+        // No usable base dir: signal "in-memory only" to the callers.
+        if (base.empty())
+            return std::filesystem::path{};
+
         // Return the full path
-        return path / ("cache_" + std::string(tag) + "_" + ss.str() + ".bin");
+        return base / ("cache_" + std::string(tag) + "_" + ss.str() + ".bin");
     }
 }
+
+void vkhelper::setPipelineCacheDir(const std::string& dir) { g_pipelineCacheBase = dir; }
 
 std::pair<vk::UniquePipelineCache, bool> vkhelper::createPipelineCache(
     const vk::detail::DispatchLoaderDynamic& dld,
@@ -201,11 +237,14 @@ std::pair<vk::UniquePipelineCache, bool> vkhelper::createPipelineCache(
     std::string_view tag
 ) {
     const std::filesystem::path path{findPipelineCache(dld, physdev, tag)};
-    const bool valid{std::filesystem::exists(path) && std::filesystem::file_size(path) > 32};
+    const bool valid{!path.empty() && std::filesystem::exists(path) && std::filesystem::file_size(path) > 32};
 
-    // Read cache data (if any)
+    // Read cache data (if any). On a fresh install the cache file does not
+    // exist yet, so gate on exists() (the directory is created by
+    // findPipelineCache, but the file itself is written only after the
+    // first pipeline build).
     std::vector<uint8_t> cacheData{};
-    if (std::filesystem::exists(path)) {
+    if (!path.empty() && std::filesystem::exists(path)) {
         std::ifstream file(path, std::ios::binary | std::ios::ate);
         if (!file.is_open())
             throw std::runtime_error("Unable to open pipeline cache file for reading");
@@ -234,6 +273,8 @@ void vkhelper::persistPipelineCache(
     std::string_view tag
 ) {
     const std::filesystem::path path{findPipelineCache(dld, physdev, tag)};
+    if (path.empty())
+        return; // no usable cache dir: keep cache in memory only
 
     std::ofstream file(path, std::ios::binary | std::ios::trunc);
     if (!file.is_open())
@@ -347,7 +388,19 @@ vk::UniqueImage vkhelper::createImageFromAhb(
         static_cast<uint32_t>(desc.height)
     };
 
-    // Create an external, importable image with TRANSFER usage for blits.
+    // Create the image for AHB import with TRANSFER usage for blits.
+    //
+    // IMPORTANT: do NOT create the image with an OPAQUE_FD external handle
+    // type (external=false). The AHB-backed gralloc memory on Android is the
+    // ANDROID_HARDWARE_BUFFER handle type, not an opaque fd. Requiring
+    // OPAQUE_FD (external=true) forces the memory type to be fd-exportable,
+    // which AHB-backed memory often is not, so vkBindImageMemory fails with
+    // VK_ERROR_INVALID_EXTERNAL_HANDLE (-1000072003). The image becomes
+    // external purely through VkImportAndroidHardwareBufferInfoANDROID below
+    // (chained into the allocation), which is the portable AHB import path and
+    // the one that works on this device's Adreno driver (see the WSI presenter
+    // import, which uses a plain VkImageCreateInfo with no external handle
+    // types and succeeds).
     auto image{createImage(
         dld,
         device,
@@ -355,13 +408,31 @@ vk::UniqueImage vkhelper::createImageFromAhb(
         format,
         1,
         usage,
-        true
+        false
     )};
 
     // Query which memory type bits the AHardwareBuffer supports and pick one that is
     // also usable by this image.
-    vk::AndroidHardwareBufferPropertiesANDROID props{};
-    if (device.getAndroidHardwareBufferPropertiesANDROID(ahb, &props, dld) != vk::Result::eSuccess)
+    //
+    // Universal-safety guard: the AHB import depends on the
+    // VK_ANDROID_external_memory_android_hardware_buffer device extension. If the
+    // device did not enable it, the dispatch-loader function pointer is NULL and
+    // calling it is a NULL-call SIGSEGV (the exact crash that killed the app on
+    // Adreno). Verify the pointer is resolved before using it.
+    auto getAhbProps{dld.vkGetAndroidHardwareBufferPropertiesANDROID};
+    if (!getAhbProps) {
+        throw std::runtime_error(
+            "device lacks vkGetAndroidHardwareBufferPropertiesANDROID; enable "
+            "VK_ANDROID_external_memory_android_hardware_buffer on the device");
+    }
+
+    // sType MUST be set to the correct value; a zero-initialized struct has
+    // sType = VK_STRUCTURE_TYPE_UNKNOWN, which strict drivers (Adreno) reject or
+    // mis-handle when querying buffer properties. Use the C struct since the raw
+    // PFN from the dispatch loader expects the C type.
+    VkAndroidHardwareBufferPropertiesANDROID props{};
+    props.sType = VK_STRUCTURE_TYPE_ANDROID_HARDWARE_BUFFER_PROPERTIES_ANDROID;
+    if (getAhbProps(static_cast<VkDevice>(device), ahb, &props) != VK_SUCCESS)
         throw std::runtime_error("vkGetAndroidHardwareBufferPropertiesANDROID failed");
 
     const auto requirements{device.getImageMemoryRequirements(*image, dld)};

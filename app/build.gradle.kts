@@ -12,8 +12,8 @@ android {
         applicationId = "com.lsfg.fork"
         minSdk = 29
         targetSdk = 35
-        versionCode = 7
-        versionName = "1.7"
+        versionCode = 12
+        versionName = "1.12"
         ndk {
             abiFilters += listOf("arm64-v8a", "x86_64")
         }
@@ -40,6 +40,7 @@ android {
     buildFeatures {
         compose = true
         buildConfig = true
+        aidl = true
     }
 
     compileOptions {
@@ -85,4 +86,9 @@ dependencies {
 
     // libsu 5.x (com.topjohnwu.superuser API) for root shell execution
     implementation("com.github.topjohnwu.libsu:core:5.3.0")
+    // libsu service: RootService binder for the ported RootCaptureEngine
+    implementation("com.github.topjohnwu.libsu:service:5.3.0")
+    // Shizuku (dev.rikka) API + provider for the ported ShizukuCaptureEngine
+    implementation("dev.rikka.shizuku:api:13.1.5")
+    implementation("dev.rikka.shizuku:provider:13.1.5")
 }

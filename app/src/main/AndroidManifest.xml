@@ -1,5 +1,6 @@
 <?xml version="1.0" encoding="utf-8"?>
-<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:tools="http://schemas.android.com/tools">
 
     <uses-permission android:name="android.permission.SYSTEM_ALERT_WINDOW" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
@@ -8,6 +9,12 @@
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
     <uses-permission android:name="android.permission.INTERNET" />
     <uses-permission android:name="android.permission.QUERY_ALL_PACKAGES" />
+    <!-- Shizuku (dev.rikka) privileged API: required for the Shizuku capture
+         path (port of the LSFG-Android reference ShizukuCaptureEngine). -->
+    <uses-permission android:name="moe.shizuku.manager.permission.API_V23" />
+    <uses-permission
+        android:name="android.permission.INTERACT_ACROSS_USERS_FULL"
+        tools:ignore="MissingPermission" />
 
     <application
         android:name=".LSFGApp"
@@ -49,5 +56,38 @@
                 android:name="android.support.FILE_PROVIDER_PATHS"
                 android:resource="@xml/file_paths" />
         </provider>
+
+        <!-- Shizuku provider (dev.rikka.shizuku:provider) required by the
+             Shizuku API to bind the capture user-service. -->
+        <provider
+            android:name="rikka.shizuku.ShizukuProvider"
+            android:authorities="${applicationId}.shizuku"
+            android:enabled="true"
+            android:exported="true"
+            android:multiprocess="false"
+            android:permission="android.permission.INTERACT_ACROSS_USERS_FULL" />
+
+        <!-- Port of the reference RootCaptureService (extends libsu
+             com.topjohnwu.superuser.ipc.RootService). Lint cannot resolve the
+             parent across the AAR boundary; suppress the false positive. -->
+        <service
+            android:name=".session.RootCaptureService"
+            android:exported="false"
+            tools:ignore="Instantiatable" />
+
+        <!-- Port of the reference LsfgAccessibilityService (foreground-package
+             awareness). Optional: the session works without it enabled. -->
+        <service
+            android:name=".session.LsfgAccessibilityService"
+            android:exported="true"
+            android:label="@string/accessibility_service_label"
+            android:permission="android.permission.BIND_ACCESSIBILITY_SERVICE">
+            <intent-filter>
+                <action android:name="android.accessibilityservice.AccessibilityService" />
+            </intent-filter>
+            <meta-data
+                android:name="android.accessibilityservice"
+                android:resource="@xml/accessibility_service_config" />
+        </service>
     </application>
 </manifest>

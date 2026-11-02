@@ -296,6 +296,15 @@ Java_com_lsfg_fork_framegen_FramegenBridge_nativeInit(JNIEnv* env, jclass, jstri
     }
 }
 
+JNIEXPORT void JNICALL
+Java_com_lsfg_fork_framegen_FramegenBridge_nativeSetCacheDir(JNIEnv* env, jclass, jstring dir) {
+    if (!dir) return;
+    const char* d = env->GetStringUTFChars(dir, nullptr);
+    try { vkhelper::setPipelineCacheDir(d); }
+    catch (const std::exception& e) { FLOGE("setCacheDir: %s", e.what()); }
+    env->ReleaseStringUTFChars(dir, d);
+}
+
 JNIEXPORT jboolean JNICALL
 Java_com_lsfg_fork_framegen_FramegenBridge_nativeCreateSession(
     JNIEnv* env, jclass, jlong handle,

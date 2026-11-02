@@ -9,7 +9,10 @@ import android.os.Build
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
 import com.lsfg.fork.capture.CaptureEngine
+import com.lsfg.fork.capture.RootCaptureEngineAdapter
+import com.lsfg.fork.capture.ShizukuCaptureEngineAdapter
 import com.lsfg.fork.framegen.FramegenBridge
+import com.lsfg.fork.session.NativeBridge
 import com.lsfg.fork.testpattern.TestPattern
 import com.lsfg.fork.wsi.WsiBridge
 import kotlinx.coroutines.Dispatchers
@@ -87,6 +90,8 @@ class SessionManager : ViewModel() {
     val state: StateFlow<State> = _state.asStateFlow()
 
     private var engine: CaptureEngine? = null
+    private var privilegedCapture: RootCaptureEngineAdapter? = null
+    private var shizukuCapture: ShizukuCaptureEngineAdapter? = null
     private var testPattern: TestPattern? = null
     private var testThread: Thread? = null
     @Volatile private var windowPtr: Long = 0L
@@ -223,7 +228,7 @@ class SessionManager : ViewModel() {
             val dllPath = userDllPath?.takeIf { it.isNotBlank() } ?: extractShaderDll(appContext)
             val srcLabel = if (userDllPath != null && userDllPath.isNotBlank()) "user" else "bundled"
             Log.i(TAG, "beginSession: setting up framegen from $dllPath ($srcLabel)")
-            val ok = setupFramegen(w, h, s, dllPath)
+            val ok = setupFramegen(w, h, s, dllPath, appContext)
             framegenSessionOk = ok
             _state.update {
                 it.copy(
@@ -254,6 +259,14 @@ class SessionManager : ViewModel() {
         }
 
         // 4. Frame source: built-in test pattern OR capture engine.
+        // Privileged (root/shizuku) engines feed frames through NativeBridge;
+        // wire the session sink (framegen drive or passthrough) before start.
+        NativeBridge.sessionFrameSink = { hb ->
+            val ptr = WsiBridge.nativeAhbPtr(hb)
+            if (framegenSessionOk && ptr != 0L) driveFramegen(hb, ptr, _state.value.multiplier)
+            else if (ptr != 0L) WsiBridge.nativePushFrame(ptr)
+            else 0
+        }
         val onStats = { fps: Float, lat: Float, err: String? ->
             // Honest health check: the session is only "OK" if the presenter
             // has actually presented at least one frame (Vulkan path live).
@@ -307,10 +320,16 @@ class SessionManager : ViewModel() {
                     val elapsed = System.nanoTime() - t0
                     val sleep = intervalNs - elapsed
                     if (sleep > 0) {
-                        val sNanos = (sleep / 1_000_000_000L).coerceAtLeast(0)
-                        val sNano = (sleep % 1_000_000_000L)
-                        if (sNanos > 0) Thread.sleep(sNanos)
-                        if (sNano > 0) Thread.sleep(0, sNano.toInt())
+                        // BUG FIX (real-device crash): the old code split the sleep
+                        // into Thread.sleep(seconds) + Thread.sleep(0, nanos).
+                        // intervalNs = 33,333,333 ns, so seconds = 0 and nanos =
+                        // 33,333,333 -> Thread.sleep(0, 33_333_333) threw
+                        // IllegalArgumentException("nanos > 999999: ...") on the
+                        // 8 Gen 2 device and killed the whole app.
+                        // Thread.sleep(millis, nanos) requires nanos < 1,000,000.
+                        val millis = sleep / 1_000_000L
+                        val nanos = (sleep % 1_000_000L).toInt()
+                        Thread.sleep(millis, nanos)
                     }
                 }
                 Log.i(TAG, "testpattern stopped after $ok frames")
@@ -318,6 +337,34 @@ class SessionManager : ViewModel() {
             Log.i(TAG, "beginSession: test pattern source started (30 fps)")
         } else {
             val mode = s.captureMode
+            // Privileged ScreenCapture path (ported reference skeleton):
+            // root -> libsu RootService binder, shizuku -> Shizuku user service.
+            // If the privileged backend is not ready (no root grant / Shizuku
+            // not running), fall back to the legacy screencap/MediaProjection
+            // paths so the session still starts.
+            var usedPrivileged = false
+            if (mode == "root") {
+                val adapter = RootCaptureEngineAdapter(appContext)
+                if (adapter.isReady()) {
+                    privilegedCapture = adapter
+                    usedPrivileged = true
+                    startPrivilegedCapture(adapter, s, appContext)
+                }
+            } else if (mode == "shizuku") {
+                val adapter = ShizukuCaptureEngineAdapter(appContext)
+                if (adapter.isReady()) {
+                    shizukuCapture = adapter
+                    usedPrivileged = true
+                    startPrivilegedCapture(adapter, s, appContext)
+                }
+            }
+            if (usedPrivileged) {
+                Log.i(TAG, "beginSession: privileged capture started (mode=$mode)")
+            } else if (mode == "root" || mode == "shizuku") {
+                Log.w(TAG, "beginSession: mode=$mode backend not ready -> fallback")
+                _state.update { it.copy(statusMsg = "$mode backend not ready -> fallback") }
+            }
+            if (!usedPrivileged) {
             var proj: MediaProjection? = null
             if (mode == "nonroot") {
                 proj = createProjection(appContext)
@@ -353,6 +400,7 @@ class SessionManager : ViewModel() {
             eng.start()
             mediaProjection = proj
             Log.i(TAG, "beginSession: capture engine started (mode=$mode rootFallback=${eng.rootFallback})")
+            }
         }
 
         if (framegenSessionOk) {
@@ -360,6 +408,51 @@ class SessionManager : ViewModel() {
             Log.i(TAG, "beginSession: RUNNING (framegen path active)")
         } else {
             Log.i(TAG, "beginSession: RUNNING (passthrough path)")
+        }
+    }
+
+    /**
+     * Start a privileged capture engine (root or shizuku). Frames arrive via
+     * AIDL -> NativeBridge.sessionFrameSink (framegen or passthrough).
+     * The capture size is the display size; framegen operates on its own
+     * aligned session extent, so no resize is needed here.
+     */
+    private fun startPrivilegedCapture(
+        adapter: Any,
+        s: State,
+        appContext: Context
+    ) {
+        val onStats = { fps: Float, lat: Float, err: String? ->
+            val presented = try { WsiBridge.framesPresented() } catch (_: Throwable) { 0L }
+            val healthy = presented > 0L && err == null
+            val status = if (err != null) err
+                else if (presented == 0L) "running BUT presenter produced 0 frames (check logcat lsfg-wsi)"
+                else "running: ${s.captureMode} -> LSFG -> overlay"
+            _state.update {
+                it.copy(
+                    fps = fps,
+                    captureLatencyMs = lat,
+                    queueDepth = try { WsiBridge.queueSize() } catch (_: Throwable) { 0 },
+                    framesPresented = presented,
+                    pipelineOk = healthy,
+                    statusMsg = status
+                )
+            }
+        }
+        val onStatsShizuku: (Float, Float, String?) -> Unit = onStats
+        val target = s.targetPkg?.takeIf { it.isNotBlank() } ?: appContext.packageName
+        val maxFps = s.targetFps.toInt().coerceIn(15, 120)
+        when (adapter) {
+            is RootCaptureEngineAdapter -> {
+                adapter.onStats = onStats
+                adapter.onError = { msg -> _state.update { it.copy(statusMsg = msg) } }
+                adapter.startCapture(target, displayW, displayH, maxFps)
+            }
+            is ShizukuCaptureEngineAdapter -> {
+                adapter.onStats = onStatsShizuku
+                adapter.onError = { msg -> _state.update { it.copy(statusMsg = msg) } }
+                adapter.startCapture(target, displayW, displayH, maxFps)
+            }
         }
     }
 
@@ -448,11 +541,17 @@ class SessionManager : ViewModel() {
         return produced
     }
 
-    private fun setupFramegen(w: Int, h: Int, s: State, dllPath: String): Boolean {
+    private fun setupFramegen(w: Int, h: Int, s: State, dllPath: String, appContext: Context): Boolean {
         return try {
-            // Performance mode selects the half-precision shader variants from the
-            // DLL; it must match at init time (the shader modules are compiled
-            // once per instance), so re-initialize whenever it changes.
+            // Keep the pipeline cache in the app's writable internal directory.
+            try {
+                val cacheDir = java.io.File(appContext.filesDir, "lsfg-cache").apply { mkdirs() }
+                FramegenBridge.setCacheDir(cacheDir.absolutePath)
+                Log.i(TAG, "pipeline cache dir: ${cacheDir.absolutePath} (writable=${cacheDir.canWrite()})")
+            } catch (t: Throwable) {
+                Log.w(TAG, "setCacheDir fallback to env/default: ${t.message}")
+            }
+            // Performance mode selects the shader variants when the instance initializes.
             val okInit = FramegenBridge.init(dllPath, allowFP16 = s.performance)
             if (!okInit) {
                 Log.e(TAG, "framegen init FAILED for $dllPath")
@@ -525,6 +624,11 @@ class SessionManager : ViewModel() {
         testPattern = null
         try { engine?.release() } catch (t: Throwable) { Log.w(TAG, "engine release: ${t.message}") }
         engine = null
+        try { privilegedCapture?.release() } catch (_: Throwable) {}
+        privilegedCapture = null
+        try { shizukuCapture?.release() } catch (_: Throwable) {}
+        shizukuCapture = null
+        NativeBridge.sessionFrameSink = null
         try { WsiBridge.stop() } catch (t: Throwable) { Log.w(TAG, "wsi stop: ${t.message}") }
         if (framegenSessionOk) {
             try { FramegenBridge.idle() } catch (_: Throwable) {}

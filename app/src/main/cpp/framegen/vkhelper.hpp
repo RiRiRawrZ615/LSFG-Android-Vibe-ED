@@ -94,6 +94,13 @@ namespace vkhelper {
     );
 
     ///
+    /// Set the base directory for pipeline cache files (call once at init).
+    /// On Android this must be the app's internal files dir (/data/data/<pkg>/files/lsfg-cache).
+    /// Empty string: fall back to XDG/HOME env dirs, then /tmp/lsfg-vk.
+    ///
+    void setPipelineCacheDir(const std::string& dir);
+
+    ///
     /// Create and maintain the Vulkan pipeline cache for lsfg-vk
     ///
     /// @param tag Cache tag for different pipelines
@@ -148,9 +155,13 @@ namespace vkhelper {
 #if defined(__ANDROID__)
     ///
     /// Create and allocate an external Vulkan image imported from an AHardwareBuffer.
-    /// The image is created with the AHardwareBuffer's width/height/format, external
-    /// opaque-fd memory type, and TRANSFER_SRC|TRANSFER_DST usage so it can be blitted
-    /// from (or to). Returns the created image; the memory is allocated and bound.
+    /// The image is created with the AHardwareBuffer's width/height/format and
+    /// TRANSFER_SRC|TRANSFER_DST usage so it can be blitted from (or to). The
+    /// external backing is established via VkImportAndroidHardwareBufferInfoANDROID
+    /// (the AHB handle type), NOT an opaque-fd external handle type; requiring
+    /// OPAQUE_FD fails vkBindImageMemory with VK_ERROR_INVALID_EXTERNAL_HANDLE on
+    /// Adreno where AHB gralloc memory is not fd-exportable. Returns the created
+    /// image; the memory is allocated and bound.
     ///
     /// @param dld Dynamic dispatch loader
     /// @param device Vulkan device

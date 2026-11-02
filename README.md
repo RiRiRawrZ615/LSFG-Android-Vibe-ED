@@ -1,8 +1,8 @@
 # LSFG-Android-Vibe-ED
 
-> ## ⚠️ WORK IN PROGRESS ⚠️
+> ## ⚠️ WORK IN PROGRESS
 > **Early, experimental Android port. It compiles to an APK but is NOT finished and NOT recommended for daily use.**
-> Core frame-generation is not fully wired end-to-end, some capture paths are unimplemented, and on-device testing is incomplete. Expect rough edges, bugs, and things that simply don't work yet. Do not treat this as production-ready.
+> **Frame generation is NOT working yet on-device:** the pipeline builds and wires up, but the on-device frame flow (source AHardwareBuffer import + test-pattern path) is still under active debugging as of v1.12. Some capture paths are unimplemented, and on-device testing is incomplete. Expect rough edges, bugs, and things that simply don't work yet. Do not treat this as production-ready.
 
 **LSFG** (Lossless Scaling **Frame Gen**) is a real-time, Vulkan-based frame interpolation + upscaling pipeline that sits between the running application and the display to produce additional, smooth, high-quality interpolated frames. This repository is an **Android port** of the `lsfg-vk` compute pipeline: a native C++ Vulkan frame-generation engine, a Vulkan WSI presenter for an overlay, and a brand-new **Kotlin + Jetpack Compose (Material You)** front-end.
 
@@ -37,7 +37,7 @@
 
 ## Status
 - ✅ Builds to a debug APK (`arm64-v8a` + `x86_64`)
-- ✅ **Framegen pipeline wired end-to-end** (LSFG `v3_1`), ON by default, with transparent passthrough fallback
+- 🚧 **Framegen pipeline (LSFG `v3_1`): built + wired, NOT working yet on-device** — pipeline stages build fully, but source AHB import / frame flow is still under active debugging (v1.12)
 - ✅ **Foreground service + sticky control notification** (start/stop, multiplier, capture mode, live status)
 - ✅ **MIUI-safe visual-only overlay** (`TYPE_APPLICATION_OVERLAY`, non-touchable)
 - ✅ **Three capture modes**: non-root (MediaProjection), Shizuku, root (screencap)

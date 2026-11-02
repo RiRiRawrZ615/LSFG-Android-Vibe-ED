@@ -203,7 +203,6 @@ fun HomeScreen(
                         FilterChip(
                             selected = s.captureMode == "shizuku",
                             onClick = { session.setCaptureMode("shizuku") },
-                            enabled = s.rootInfo.root, // Shizuku needs at least shell access
                             label = { Text("Shizuku") }
                         )
                         FilterChip(
@@ -216,7 +215,7 @@ fun HomeScreen(
                     Text(
                         when (s.captureMode) {
                             "root" -> "Uses root shell (screencap via su). Highest performance."
-                            "shizuku" -> "Uses Shizuku ScreenCapture API. Works without root if Shizuku is running."
+                            "shizuku" -> "Uses shell screencap via Shizuku (base64 read-back). Needs Shizuku running."
                             "nonroot" -> "Uses MediaProjection (system screen capture dialog). No root needed."
                             else -> "Capture mode: ${s.captureMode}"
                         },

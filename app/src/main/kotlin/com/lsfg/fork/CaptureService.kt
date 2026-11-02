@@ -100,7 +100,13 @@ class CaptureService : Service() {
                 Log.i(TAG, "ACTION_PREPARE: holding mediaProjection FGS for the consent picker")
             }
             ACTION_START -> {
+                // The consent token is held only for nonroot captures; reset the
+                // flag on every start so a stale value from a previous nonroot
+                // session cannot make us declare the mediaProjection FGS type
+                // for a root/shizuku session.
                 consentHeld = intent?.getBooleanExtra(EXTRA_HAS_CONSENT, false) ?: false
+                usingMediaProjection = false
+                hasActiveProjection = false
                 startSession()
             }
             // CRITICAL FIX ("repeatedly loops and crashes"): on a null intent the

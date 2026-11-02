@@ -1,6 +1,9 @@
 #include "lsfg_display.h"
 
+#include <android/hardware_buffer.h>
+
 #include <algorithm>
+#include <deque>
 
 namespace {
     std::mutex g_mutex;
@@ -12,12 +15,23 @@ namespace {
 namespace lsfgdisplay {
 
 void push(uintptr_t ahbPtr) {
+    if (!ahbPtr)
+        return;
+    // Acquire the queue's reference BEFORE enqueueing so the producer may
+    // release its own reference (e.g. close the Java HardwareBuffer) right
+    // after pushing without freeing a buffer that is still queued.
+    AHardwareBuffer_acquire(reinterpret_cast<AHardwareBuffer*>(ahbPtr));
+    uintptr_t dropped{0};
     {
         std::lock_guard<std::mutex> lock(g_mutex);
-        if (g_queue.size() >= kMaxQueue)
+        if (g_queue.size() >= kMaxQueue) {
+            dropped = g_queue.front();
             g_queue.pop_front(); // drop oldest (backpressure)
+        }
         g_queue.push_back(ahbPtr);
     }
+    if (dropped)
+        AHardwareBuffer_release(reinterpret_cast<AHardwareBuffer*>(dropped));
     g_cv.notify_one();
 }
 
@@ -33,12 +47,19 @@ uintptr_t pop(int timeoutMs) {
         return 0;
     uintptr_t item = g_queue.front();
     g_queue.pop_front();
+    // The queue's reference is transferred to the caller, who must release it
+    // once the GPU is done with the frame.
     return item;
 }
 
 void clear() {
-    std::lock_guard<std::mutex> lock(g_mutex);
-    g_queue.clear();
+    std::deque<uintptr_t> queued;
+    {
+        std::lock_guard<std::mutex> lock(g_mutex);
+        queued.swap(g_queue);
+    }
+    for (uintptr_t item : queued)
+        AHardwareBuffer_release(reinterpret_cast<AHardwareBuffer*>(item));
 }
 
 int size() {

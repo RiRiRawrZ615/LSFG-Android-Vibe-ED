@@ -53,6 +53,20 @@ android {
     }
 }
 
+// Host-side regression test for the pure-C++ shader DLL parser.
+val exe = "build/dll_parser_test"
+val runDllParserTest = tasks.register<Exec>("runDllParserTest") {
+    workingDir = file("src/test/cpp")
+    commandLine(
+        "/bin/sh", "-c",
+        "mkdir -p build && g++ -std=c++20 -O0 -o $exe main.cpp " +
+            "../../main/cpp/framegen/library/dll.cpp -I ../../main/cpp/framegen " +
+            "&& $exe ../../main/assets/lsfg-vk.dll"
+    )
+}
+tasks.matching { it.name == "testDebugUnitTest" || it.name == "testReleaseUnitTest" }
+    .configureEach { dependsOn(runDllParserTest) }
+
 kotlin {
     jvmToolchain(17)
 }

@@ -472,16 +472,29 @@ Pipeline& Context::pipeline() {
 }
 
 Instance::~Instance() {
-    if (!this->m_impl->vk.leakInstance)
+    // Skip cleanup when leakInstance is set (handles are left for the process
+    // to reclaim). Otherwise let the RAII owners do the destruction:
+    // reset() destroys the handle AND clears ownership, so the member
+    // destructors that run afterwards are no-ops (a manual destroy() while
+    // the wrappers still owned the handles would destroy them twice).
+    //
+    // The implicit member order already matches Vulkan's requirements:
+    // shaderLibrary (device objects) is destroyed before vk, and inside vk
+    // the device is declared before the instance while the dispatch loader
+    // (dld) is declared first and outlives both.
+    if (this->m_impl->vk.leakInstance)
         return;
 
     try {
-        new std::unique_ptr<vk::detail::DispatchLoaderDynamic>(std::move(this->m_impl->vk.dld));
-        new vk::UniqueDevice(std::move(this->m_impl->vk.device));
-        new vk::UniqueInstance(std::move(this->m_impl->vk.instance));
+        // Shader modules are device objects and must be destroyed first.
+        this->m_impl->shaderLibrary.destroy();
+        if (this->m_impl->vk.device)
+            this->m_impl->vk.device.reset();
+        if (this->m_impl->vk.instance)
+            this->m_impl->vk.instance.reset();
     } catch (...) {
         if (!this->m_impl->logCallback)
             return;
-        this->m_impl->logCallback("Failed to leak Vulkan instance and device");
+        this->m_impl->logCallback("Failed to destroy Vulkan instance and device");
     }
 }

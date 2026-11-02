@@ -56,6 +56,17 @@ namespace lsfgvk {
             return perf ? this->m_performanceShaders.at(name) : this->m_qualityShaders.at(name);
         }
 
+        ///
+        /// Destroy all shader modules. Must be called before the Vulkan device
+        /// they belong to is destroyed (the implicit destructor would otherwise
+        /// run after the device is gone). Safe to call twice.
+        ///
+        void destroy() {
+            this->m_baseShaders.clear();
+            this->m_qualityShaders.clear();
+            this->m_performanceShaders.clear();
+        }
+
     private:
         std::unordered_map<std::string_view, vk::UniqueShaderModule> m_baseShaders;
         std::unordered_map<std::string_view, vk::UniqueShaderModule> m_qualityShaders;

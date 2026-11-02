@@ -150,8 +150,16 @@ namespace {
         VkFence presentFence{};
         VkCommandPool cmdPool{};
 
-        std::map<uintptr_t, VkImage> ahbImages;
-        std::map<uintptr_t, VkImageView> ahbViews;
+        // Imported AHB frames. Each record owns the full import: the image
+        // view, the image, and the device memory bound to it. All three must
+        // be released together (view -> image -> memory) on eviction and at
+        // shutdown; destroying the image alone leaks the VkDeviceMemory.
+        struct AhbImport {
+            VkImageView view{};
+            VkImage image{};
+            VkDeviceMemory memory{};
+        };
+        std::map<uintptr_t, AhbImport> ahbImports;
 
         ANativeWindow* window{nullptr};
         uint32_t width{0};
@@ -159,8 +167,18 @@ namespace {
         bool surfaceValid{false};
 
         std::thread thread;
+        // running: request to present frames / thread-liveness signal. It is
+        // NOT a cleanup state: stopPresenter() must run even after the present
+        // thread has cleared it itself (terminal GPU failure).
         std::atomic<bool> running{false};
         std::atomic<bool> paused{false};
+
+        // Set when a submitted command buffer's completion could not be
+        // confirmed (fence timeout / device loss). The command buffer is kept
+        // in pendingCmdbuf and must not be freed while the GPU may still be
+        // executing it; stopPresenter() applies the terminal-failure teardown.
+        bool gpuFailure{false};
+        VkCommandBuffer pendingCmdbuf{};
 
         float targetFps{60.0f};
         uint64_t framesPresented{0};
@@ -191,20 +209,68 @@ namespace {
         return m;
     }
 
-    void stopPresenter() {
-        if (!g_presenter.running) return;
-        g_presenter.running = false;
-        if (g_presenter.thread.joinable())
-            g_presenter.thread.join();
-        g_presenter.paused = false;
-        lsfgdisplay::clear();
-        vkDeviceWaitIdle(g_presenter.device);
-        for (auto& [key, view] : g_presenter.ahbViews)
-            vkDestroyImageView(g_presenter.device, view, nullptr);
-        g_presenter.ahbViews.clear();
-        for (auto& [key, image] : g_presenter.ahbImages)
-            vkDestroyImage(g_presenter.device, image, nullptr);
-        g_presenter.ahbImages.clear();
+    // Tear down one imported AHB in the order Vulkan requires: image view
+    // first, then the image, then the device memory bound to it. Every
+    // successful import is released exactly once, through this function.
+    void destroyAhbImport(Presenter::AhbImport& imp) {
+        if (imp.view) {
+            vkDestroyImageView(g_presenter.device, imp.view, nullptr);
+            imp.view = VK_NULL_HANDLE;
+        }
+        if (imp.image) {
+            vkDestroyImage(g_presenter.device, imp.image, nullptr);
+            imp.image = VK_NULL_HANDLE;
+        }
+        if (imp.memory) {
+            vkFreeMemory(g_presenter.device, imp.memory, nullptr);
+            imp.memory = VK_NULL_HANDLE;
+        }
+    }
+
+    // Tear down whatever Vulkan resources exist, in dependency order, and clear
+    // the trackers so a second call is a cheap no-op. Handles partially
+    // initialized state from a failed startup as well as a full session.
+    //
+    // gpuFailure means a submitted command buffer's completion was never
+    // confirmed (fence timeout / device loss) or the device could not be
+    // brought to idle. In that state destroying ANY part of the Vulkan
+    // ownership hierarchy is invalid: the pending command buffer may still be
+    // executing, so its command pool, fence, swapchain, imported image/memory
+    // and the device/instance itself must not be destroyed (and destroying the
+    // device would dangle every retained child handle). The entire hierarchy is
+    // therefore retained and leaked until process exit, where the OS reclaims
+    // it. This is a bounded, documented terminal-failure leak, preferred over
+    // use-after-free or undefined behavior. Normal shutdown (gpuFailure false)
+    // destroys everything.
+    static void teardownVulkanResources() {
+        if (g_presenter.gpuFailure) {
+            WLOGE("GPU failure: retaining Vulkan device/instance, pool, fence, swapchain, "
+                   "%zu import(s) and pending command buffer until process exit",
+                   g_presenter.ahbImports.size());
+            g_presenter.ahbImports.clear();
+            g_presenter.pendingCmdbuf = VK_NULL_HANDLE;
+            g_presenter.swapchainCount = 0;
+            g_presenter.swapchain = VK_NULL_HANDLE;
+            g_presenter.cmdPool = VK_NULL_HANDLE;
+            g_presenter.presentFence = VK_NULL_HANDLE;
+            g_presenter.imageAcquired = VK_NULL_HANDLE;
+            g_presenter.frameReady = VK_NULL_HANDLE;
+            g_presenter.device = VK_NULL_HANDLE;
+            g_presenter.surface = VK_NULL_HANDLE;
+            g_presenter.instance = VK_NULL_HANDLE;
+            g_presenter.physdev = VK_NULL_HANDLE;
+            g_presenter.queue = VK_NULL_HANDLE;
+            return;
+        }
+        // Normal shutdown: the device is idle, so no GPU operation is still
+        // using the cached imports or any command buffer.
+        for (auto& [key, imp] : g_presenter.ahbImports)
+            destroyAhbImport(imp);
+        g_presenter.ahbImports.clear();
+        if (g_presenter.pendingCmdbuf) {
+            vkFreeCommandBuffers(g_presenter.device, g_presenter.cmdPool, 1, &g_presenter.pendingCmdbuf);
+            g_presenter.pendingCmdbuf = VK_NULL_HANDLE;
+        }
         for (uint32_t i = 0; i < g_presenter.swapchainCount; i++) {
             if (g_presenter.swapchainViews[i])
                 vkDestroyImageView(g_presenter.device, g_presenter.swapchainViews[i], nullptr);
@@ -213,16 +279,19 @@ namespace {
         if (g_presenter.swapchain)
             vkDestroySwapchainKHR(g_presenter.device, g_presenter.swapchain, nullptr);
         g_presenter.swapchain = VK_NULL_HANDLE;
+        g_presenter.swapchainCount = 0;
         if (g_presenter.cmdPool)
             vkDestroyCommandPool(g_presenter.device, g_presenter.cmdPool, nullptr);
         g_presenter.cmdPool = VK_NULL_HANDLE;
         if (g_presenter.presentFence)
             vkDestroyFence(g_presenter.device, g_presenter.presentFence, nullptr);
+        g_presenter.presentFence = VK_NULL_HANDLE;
         if (g_presenter.imageAcquired)
             vkDestroySemaphore(g_presenter.device, g_presenter.imageAcquired, nullptr);
+        g_presenter.imageAcquired = VK_NULL_HANDLE;
         if (g_presenter.frameReady)
             vkDestroySemaphore(g_presenter.device, g_presenter.frameReady, nullptr);
-        g_presenter.framesPresented = 0;
+        g_presenter.frameReady = VK_NULL_HANDLE;
         if (g_presenter.device)
             vkDestroyDevice(g_presenter.device, nullptr);
         g_presenter.device = VK_NULL_HANDLE;
@@ -232,20 +301,68 @@ namespace {
         if (g_presenter.instance)
             vkDestroyInstance(g_presenter.instance, nullptr);
         g_presenter.instance = VK_NULL_HANDLE;
+        g_presenter.physdev = VK_NULL_HANDLE;
+        g_presenter.queue = VK_NULL_HANDLE;
+    }
+
+    void stopPresenter() {
+        // g_initLock serializes start/stop; the present thread never calls
+        // stopPresenter, so there is no self-join and no double cleanup.
+        std::lock_guard<std::mutex> lock(g_initLock);
+        // Request stop. 'running' may already be false (the present thread
+        // clears it on a terminal GPU failure) - cleanup must still run.
+        g_presenter.running = false;
+        if (g_presenter.thread.joinable())
+            g_presenter.thread.join();
+        g_presenter.paused = false;
+        lsfgdisplay::clear();
+        if (g_presenter.instance || g_presenter.device) {
+            if (!g_presenter.gpuFailure) {
+                // vkDeviceWaitIdle establishes that no GPU work is outstanding,
+                // which is what makes the destruction below legal. A failure
+                // here means completion could not be confirmed, so switch to
+                // the terminal-failure retention path instead of destroying
+                // resources the GPU may still be using.
+                if (vkDeviceWaitIdle(g_presenter.device) != VK_SUCCESS) {
+                    WLOGE("vkDeviceWaitIdle failed; retaining Vulkan resources (terminal failure)");
+                    g_presenter.gpuFailure = true;
+                }
+            }
+            teardownVulkanResources();
+        }
+        g_presenter.framesPresented = 0;
         g_presenter.surfaceValid = false;
         g_presenter.window = nullptr;
+        g_presenter.gpuFailure = false;
+        g_presenter.pendingCmdbuf = VK_NULL_HANDLE;
         WLOG("presenter stopped");
     }
 
     void createSwapchain(uint32_t width, uint32_t height) {
-        if (g_presenter.swapchain)
-            vkDestroySwapchainKHR(g_presenter.device, g_presenter.swapchain, nullptr);
-
+        // Validate surface capabilities BEFORE destroying the old swapchain,
+        // so a failed recreation cannot leave the presenter without a
+        // swapchain.
         VkSurfaceFormatKHR formats[16];
         uint32_t formatCount = 16;
         VK_CHECK(vkGetPhysicalDeviceSurfaceFormatsKHR(g_presenter.physdev, g_presenter.surface, &formatCount, formats));
         VkSurfaceCapabilitiesKHR caps;
         VK_CHECK(vkGetPhysicalDeviceSurfaceCapabilitiesKHR(g_presenter.physdev, g_presenter.surface, &caps));
+
+        // The present path writes into swapchain images with vkCmdCopyImage,
+        // so they must be usable as transfer destinations in addition to
+        // color attachments. Not every implementation supports that, so check
+        // the surface capabilities and fail gracefully instead of requesting
+        // unsupported usage.
+        const VkImageUsageFlags desiredUsage =
+            VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+        if ((caps.supportedUsageFlags & desiredUsage) != desiredUsage) {
+            WLOGE("surface does not support transfer-destination swapchain images "
+                   "(supportedUsageFlags=0x%X)", (unsigned)caps.supportedUsageFlags);
+            throw std::runtime_error("swapchain transfer-destination usage unsupported");
+        }
+
+        if (g_presenter.swapchain)
+            vkDestroySwapchainKHR(g_presenter.device, g_presenter.swapchain, nullptr);
 
         VkSurfaceFormatKHR chosen = formats[0];
         if (formatCount > 1) {
@@ -271,7 +388,7 @@ namespace {
         sci.imageColorSpace = chosen.colorSpace;
         sci.imageExtent = { width, height };
         sci.imageArrayLayers = 1;
-        sci.imageUsage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
+        sci.imageUsage = desiredUsage;
         sci.imageSharingMode = VK_SHARING_MODE_EXCLUSIVE;
         sci.preTransform = caps.currentTransform;
         sci.compositeAlpha = VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR;
@@ -308,17 +425,24 @@ namespace {
     // in UNDEFINED layout is undefined behavior and crashes some drivers.  We
     // run this barrier once per image (right after import) and wait for it so
     // presentLoop can safely read the image in GENERAL layout every frame.
+    // Throws on any failure. On a fence timeout / device loss the command
+    // buffer is NOT freed here (the GPU may still be executing it); it is
+    // recorded in pendingCmdbuf and handed to the terminal-failure teardown.
     void transitionToGeneral(VkImage image) {
         VkCommandBufferAllocateInfo cabi{};
         cabi.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
         cabi.commandPool = g_presenter.cmdPool;
         cabi.commandBufferCount = 1;
         VkCommandBuffer cmdbuf = VK_NULL_HANDLE;
-        vkAllocateCommandBuffers(g_presenter.device, &cabi, &cmdbuf);
+        if (vkAllocateCommandBuffers(g_presenter.device, &cabi, &cmdbuf) != VK_SUCCESS)
+            throw std::runtime_error("transitionToGeneral: vkAllocateCommandBuffers failed");
         VkCommandBufferBeginInfo bci{};
         bci.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
         bci.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
-        vkBeginCommandBuffer(cmdbuf, &bci);
+        if (vkBeginCommandBuffer(cmdbuf, &bci) != VK_SUCCESS) {
+            vkFreeCommandBuffers(g_presenter.device, g_presenter.cmdPool, 1, &cmdbuf);
+            throw std::runtime_error("transitionToGeneral: vkBeginCommandBuffer failed");
+        }
         VkImageMemoryBarrier ib{};
         ib.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
         ib.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
@@ -336,17 +460,38 @@ namespace {
         si.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
         si.commandBufferCount = 1;
         si.pCommandBuffers = &cmdbuf;
-        vkQueueSubmit(g_presenter.queue, 1, &si, g_presenter.presentFence);
-        vkWaitForFences(g_presenter.device, 1, &g_presenter.presentFence, VK_TRUE, 5000000000ull);
+        // A failed submit means nothing was queued: the command buffer was
+        // never submitted, so it is safe to free and we can rethrow.
+        if (vkQueueSubmit(g_presenter.queue, 1, &si, g_presenter.presentFence) != VK_SUCCESS) {
+            vkFreeCommandBuffers(g_presenter.device, g_presenter.cmdPool, 1, &cmdbuf);
+            throw std::runtime_error("transitionToGeneral: vkQueueSubmit failed");
+        }
+        // The barrier must actually complete before presentLoop reads the
+        // image in GENERAL layout; a timed-out wait means it may not have.
+        VkResult twr = vkWaitForFences(g_presenter.device, 1, &g_presenter.presentFence, VK_TRUE, 5000000000ull);
+        if (twr != VK_SUCCESS) {
+            // Outstanding submission: keep the command buffer (GPU may still
+            // be using it) and mark the presenter for terminal-failure teardown.
+            WLOGE("transitionToGeneral fence wait=%d; command buffer kept pending", (int)twr);
+            g_presenter.gpuFailure = true;
+            g_presenter.pendingCmdbuf = cmdbuf;
+            g_presenter.running = false;
+            throw std::runtime_error("transitionToGeneral fence wait failed");
+        }
         vkResetFences(g_presenter.device, 1, &g_presenter.presentFence);
         vkFreeCommandBuffers(g_presenter.device, g_presenter.cmdPool, 1, &cmdbuf);
     }
 
-    VkImage importAhbLocked(const void* ahb) {
+    // *outFresh (when non-null) reports whether this call created a new import
+    // (false = cache hit on a previously imported buffer).
+    VkImage importAhbLocked(const void* ahb, bool* outFresh = nullptr) {
         uintptr_t key = reinterpret_cast<uintptr_t>(ahb);
-        auto it = g_presenter.ahbImages.find(key);
-        if (it != g_presenter.ahbImages.end())
-            return it->second;
+        auto it = g_presenter.ahbImports.find(key);
+        if (it != g_presenter.ahbImports.end()) {
+            if (outFresh) *outFresh = false;
+            return it->second.image;
+        }
+        if (outFresh) *outFresh = true;
 
         AHardwareBuffer* buffer = const_cast<AHardwareBuffer*>(reinterpret_cast<const AHardwareBuffer*>(ahb));
         AHardwareBuffer_Desc desc;
@@ -361,6 +506,24 @@ namespace {
             default: break;
         }
 
+        // Resources created below are owned by this function until the import
+        // is recorded in ahbImports. If any step fails BEFORE that, everything
+        // created so far is destroyed here (no GPU work references it yet).
+        // Once recorded, ownership moves to ahbImports and no cleanup runs.
+        VkImage image = VK_NULL_HANDLE;
+        VkDeviceMemory mem = VK_NULL_HANDLE;
+        VkImageView view = VK_NULL_HANDLE;
+        bool recorded = false;
+        struct Cleanup {
+            VkImage image; VkDeviceMemory mem; VkImageView view; bool recorded;
+            ~Cleanup() {
+                if (recorded) return;
+                if (view) vkDestroyImageView(g_presenter.device, view, nullptr);
+                if (image) vkDestroyImage(g_presenter.device, image, nullptr);
+                if (mem) vkFreeMemory(g_presenter.device, mem, nullptr);
+            }
+        } guard{image, mem, view, recorded};
+
         VkImageCreateInfo ici{};
         ici.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
         ici.imageType = VK_IMAGE_TYPE_2D;
@@ -373,8 +536,8 @@ namespace {
         ici.usage = VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
         ici.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
 
-        VkImage image = VK_NULL_HANDLE;
         VK_CHECK(vkCreateImage(g_presenter.device, &ici, nullptr, &image));
+        guard.image = image;
 
         VkAndroidHardwareBufferPropertiesANDROID props{};
         props.sType = VK_STRUCTURE_TYPE_ANDROID_HARDWARE_BUFFER_PROPERTIES_ANDROID;
@@ -399,8 +562,8 @@ namespace {
         mai.pNext = &importInfo;
         mai.allocationSize = mreq.size;
         mai.memoryTypeIndex = memTypeIndex;
-        VkDeviceMemory mem = VK_NULL_HANDLE;
         VK_CHECK(vkAllocateMemory(g_presenter.device, &mai, nullptr, &mem));
+        guard.mem = mem;
         VK_CHECK(vkBindImageMemory(g_presenter.device, image, mem, 0));
 
         VkImageViewCreateInfo vci{};
@@ -409,21 +572,31 @@ namespace {
         vci.viewType = VK_IMAGE_VIEW_TYPE_2D;
         vci.format = fmt;
         vci.subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
-        VkImageView view = VK_NULL_HANDLE;
         VK_CHECK(vkCreateImageView(g_presenter.device, &vci, nullptr, &view));
+        guard.view = view;
 
-        g_presenter.ahbImages[key] = image;
-        g_presenter.ahbViews[key] = view;
+        Presenter::AhbImport imp;
+        imp.image = image;
+        imp.view = view;
+        imp.memory = mem;
+        g_presenter.ahbImports[key] = imp;
+        guard.recorded = true;  // ownership transferred to ahbImports
         WLOG("imported AHB %p (%dx%d)", ahb, desc.width, desc.height);
         // CRITICAL FIX: transition the imported image to GENERAL now (once),
         // so presentLoop can read it as a copy source.  Reading an image in
         // UNDEFINED layout (the old behavior) is undefined behavior and was
         // crashing the process ~1.2-2.8s after beginSession.
-        try {
-            transitionToGeneral(image);
-        } catch (const std::exception& e) {
-            WLOGE("transitionToGeneral failed for %p: %s (continuing; may be OK on tolerant drivers)", ahb, e.what());
-        }
+        //
+        // Failure semantics:
+        // - submit failed / pre-GPU failure: nothing was queued, the import is
+        //   safe to destroy; the exception propagates and presentLoop's
+        //   releasePoppedFrame destroys it (gpuFailure is not set).
+        // - fence timeout / device loss: transitionToGeneral records the
+        //   command buffer as pending and sets gpuFailure; the import stays in
+        //   ahbImports and is retained by the terminal-failure teardown (the
+        //   GPU may still be transitioning it), so it must NOT be destroyed
+        //   here or by releasePoppedFrame.
+        transitionToGeneral(image);
         return image;
     }
 
@@ -438,7 +611,29 @@ namespace {
                 if (g_presenter.paused) std::this_thread::sleep_for(5ms);
                 continue;
             }
-            if (!g_presenter.surfaceValid) continue;
+            // pop() transferred the queue's AHardwareBuffer reference to us.
+            // Release it exactly once on every path below, and only after the
+            // GPU is done with the buffer.  For a freshly imported buffer
+            // (cache miss) the import must be destroyed FIRST, otherwise the
+            // import cache keeps a VkImage bound to freed memory (and a later
+            // allocator pointer reuse would hit a stale cache entry).
+            bool freshImport = false;
+            auto releasePoppedFrame = [&]() {
+                // On a terminal GPU failure the import and AHB ref are abandoned
+                // with the device (the pending command buffer may still be using
+                // them); stopPresenter()'s teardown handles that path.
+                if (g_presenter.gpuFailure)
+                    return;
+                if (freshImport) {
+                    auto iit = g_presenter.ahbImports.find(frame);
+                    if (iit != g_presenter.ahbImports.end()) {
+                        destroyAhbImport(iit->second);
+                        g_presenter.ahbImports.erase(iit);
+                    }
+                }
+                AHardwareBuffer_release(reinterpret_cast<AHardwareBuffer*>(frame));
+            };
+            if (!g_presenter.surfaceValid) { releasePoppedFrame(); continue; }
 
             // Hold this frame's AHB lock for the whole GPU read (import + copy
             // + submit + fence wait) so the producer thread cannot CPU-fill
@@ -452,8 +647,8 @@ namespace {
 
             VkCommandBuffer cmdbuf = VK_NULL_HANDLE;
             try {
-                VkImage srcImage = importAhbLocked(reinterpret_cast<const void*>(frame));
-                if (!srcImage) continue;
+                VkImage srcImage = importAhbLocked(reinterpret_cast<const void*>(frame), &freshImport);
+                if (!srcImage) { releasePoppedFrame(); continue; }
 
                 // Non-blocking acquire: 0 timeout returns VK_TIMEOUT if the
                 // swapchain has no free image right now.  Using UINT64_MAX here
@@ -465,13 +660,15 @@ namespace {
                     g_presenter.imageAcquired, VK_NULL_HANDLE, &imageIndex);
                 if (ar == VK_TIMEOUT || ar == VK_NOT_READY) {
                     std::this_thread::sleep_for(2ms);
+                    releasePoppedFrame();
                     continue;
                 }
                 if (ar == VK_SUBOPTIMAL_KHR || ar == VK_ERROR_OUT_OF_DATE_KHR) {
                     createSwapchain(g_presenter.width, g_presenter.height);
+                    releasePoppedFrame();
                     continue;
                 }
-                if (ar != VK_SUCCESS) { WLOGE("acquire=%d", (int)ar); continue; }
+                if (ar != VK_SUCCESS) { WLOGE("acquire=%d", (int)ar); releasePoppedFrame(); continue; }
 
                 // CRITICAL FIX (was the real ~1.2-2.8s crash): the old code
                 // (a) called vkResetCommandPool EVERY frame while the previous
@@ -494,6 +691,7 @@ namespace {
                 if (aRes != VK_SUCCESS) {
                     WLOGE("vkAllocateCommandBuffers=%d", (int)aRes);
                     std::this_thread::sleep_for(2ms);
+                    releasePoppedFrame();
                     continue;
                 }
                 VkCommandBufferBeginInfo bci{};
@@ -504,6 +702,7 @@ namespace {
                     WLOGE("vkBeginCommandBuffer=%d", (int)bRes);
                     vkFreeCommandBuffers(g_presenter.device, g_presenter.cmdPool, 1, &cmdbuf);
                     cmdbuf = VK_NULL_HANDLE;
+                    releasePoppedFrame();
                     continue;
                 }
 
@@ -559,6 +758,7 @@ namespace {
                 if (vkQueueSubmit(g_presenter.queue, 1, &si, g_presenter.presentFence) != VK_SUCCESS) {
                     vkFreeCommandBuffers(g_presenter.device, g_presenter.cmdPool, 1, &cmdbuf);
                     cmdbuf = VK_NULL_HANDLE;
+                    releasePoppedFrame();
                     continue;
                 }
 
@@ -580,22 +780,59 @@ namespace {
                 indices[0] = imageIndex;
                 pi.pSwapchains = chains;
                 pi.pImageIndices = indices;
-                vkQueuePresentKHR(g_presenter.queue, &pi);
+                // A failed present must not be counted as a presented frame.
+                VkResult pr = vkQueuePresentKHR(g_presenter.queue, &pi);
+                if (pr != VK_SUCCESS && pr != VK_SUBOPTIMAL_KHR) {
+                    WLOGE("vkQueuePresentKHR=%d", (int)pr);
+                }
 
                 // Wait (finite timeout) until the GPU is done with this frame
                 // before reusing any of its resources on the next iteration.
+                // Only VK_SUCCESS confirms GPU completion; on any other result
+                // the command buffer and the source AHB may still be in use
+                // and must NOT be released here.
                 VkResult wr = vkWaitForFences(g_presenter.device, 1, &g_presenter.presentFence, VK_TRUE, 3000000000ull);
-                if (wr == VK_SUCCESS) vkResetFences(g_presenter.device, 1, &g_presenter.presentFence);
+                if (wr == VK_TIMEOUT) {
+                    // Give the GPU one more bounded chance to finish before
+                    // declaring failure. (VK_ERROR_DEVICE_LOST is not retried:
+                    // the device is already gone.)
+                    wr = vkWaitForFences(g_presenter.device, 1, &g_presenter.presentFence, VK_TRUE, 10000000000ull);
+                }
+                if (wr != VK_SUCCESS) {
+                    // GPU completion could not be confirmed (VK_TIMEOUT or
+                    // VK_ERROR_DEVICE_LOST). The command buffer may still be
+                    // executing, so it must NOT be freed here; it is recorded
+                    // as pending and the frame's import + AHB reference are
+                    // abandoned with the device by the terminal-failure
+                    // teardown in stopPresenter().
+                    if (wr == VK_ERROR_DEVICE_LOST)
+                        WLOGE("present fence: device lost; stopping presenter");
+                    else
+                        WLOGE("present fence timeout after retry; stopping presenter");
+                    g_presenter.gpuFailure = true;
+                    g_presenter.pendingCmdbuf = cmdbuf;
+                    cmdbuf = VK_NULL_HANDLE;
+                    g_presenter.running = false;
+                    // Do NOT release the frame here: the GPU may still be reading
+                    // it. Its import stays in ahbImports and its AHB ref is
+                    // abandoned with the device (terminal-failure teardown).
+                    break;
+                }
+                vkResetFences(g_presenter.device, 1, &g_presenter.presentFence);
                 // CRITICAL FIX: free the command buffer NOW that its fence has
                 // signaled (the GPU is done with it).  The old code set
                 // cmdbuf = VK_NULL_HANDLE and never freed it -> per-frame leak
                 // -> pool exhaustion -> null-buffer segfault after ~1.2-2.8s.
                 vkFreeCommandBuffers(g_presenter.device, g_presenter.cmdPool, 1, &cmdbuf);
                 cmdbuf = VK_NULL_HANDLE;
+                // The fence wait above guarantees the GPU finished reading the
+                // source, so the popped frame's reference can go now.
+                releasePoppedFrame();
                 g_presenter.framesPresented++;
             } catch (const std::exception& e) {
                 WLOGE("present loop: %s", e.what());
                 std::this_thread::sleep_for(10ms);
+                releasePoppedFrame();
             }
             // Free the command buffer on any early-exit path (acquire timeout,
             // swapchain recreate, submit failure, exception) so it is never
@@ -710,7 +947,14 @@ Java_com_lsfg_fork_wsi_WsiBridge_nativeStart(JNIEnv* env, jclass, jlong windowPt
         WLOG("presenter started");
     } catch (const std::exception& e) {
         WLOGE("nativeStart failed: %s", e.what());
+        // Partially initialized resources are torn down here (the thread was
+        // never started, so no join is needed); stopPresenter() remains safe
+        // to call later and will be a no-op.
         g_presenter.running = false;
+        if (g_presenter.instance || g_presenter.device)
+            teardownVulkanResources();
+        g_presenter.surfaceValid = false;
+        g_presenter.window = nullptr;
     }
 }
 

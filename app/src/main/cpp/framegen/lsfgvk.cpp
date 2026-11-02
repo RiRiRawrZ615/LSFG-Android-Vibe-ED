@@ -362,9 +362,16 @@ Pipeline& Context::pipeline() {
 }
 
 Instance::~Instance() {
-    // Destroy the Vulkan device and instance unless leakInstance is set.
-    // (The member unique_ptrs would tear down in reverse declaration order,
-    // which is wrong for Vulkan: device must be destroyed before instance.)
+    // Skip cleanup when leakInstance is set (handles are left for the process
+    // to reclaim). Otherwise let the RAII owners do the destruction:
+    // reset() destroys the handle AND clears ownership, so the member
+    // destructors that run afterwards are no-ops (a manual destroy() while
+    // the wrappers still owned the handles would destroy them twice).
+    //
+    // The implicit member order already matches Vulkan's requirements:
+    // shaderLibrary (device objects) is destroyed before vk, and inside vk
+    // the device is declared before the instance while the dispatch loader
+    // (dld) is declared first and outlives both.
     if (this->m_impl->vk.leakInstance)
         return;
 
@@ -372,9 +379,9 @@ Instance::~Instance() {
         // Shader modules are device objects and must be destroyed first.
         this->m_impl->shaderLibrary.destroy();
         if (this->m_impl->vk.device)
-            this->m_impl->vk.device->destroy(nullptr, *this->m_impl->vk.dld);
+            this->m_impl->vk.device.reset();
         if (this->m_impl->vk.instance)
-            this->m_impl->vk.instance->destroy(nullptr, *this->m_impl->vk.dld);
+            this->m_impl->vk.instance.reset();
     } catch (...) {
         if (!this->m_impl->logCallback)
             return;

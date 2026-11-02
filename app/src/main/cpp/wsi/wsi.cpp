@@ -150,8 +150,16 @@ namespace {
         VkFence presentFence{};
         VkCommandPool cmdPool{};
 
-        std::map<uintptr_t, VkImage> ahbImages;
-        std::map<uintptr_t, VkImageView> ahbViews;
+        // Imported AHB frames. Each record owns the full import: the image
+        // view, the image, and the device memory bound to it. All three must
+        // be released together (view -> image -> memory) on eviction and at
+        // shutdown; destroying the image alone leaks the VkDeviceMemory.
+        struct AhbImport {
+            VkImageView view{};
+            VkImage image{};
+            VkDeviceMemory memory{};
+        };
+        std::map<uintptr_t, AhbImport> ahbImports;
 
         ANativeWindow* window{nullptr};
         uint32_t width{0};
@@ -191,6 +199,24 @@ namespace {
         return m;
     }
 
+    // Tear down one imported AHB in the order Vulkan requires: image view
+    // first, then the image, then the device memory bound to it. Every
+    // successful import is released exactly once, through this function.
+    void destroyAhbImport(Presenter::AhbImport& imp) {
+        if (imp.view) {
+            vkDestroyImageView(g_presenter.device, imp.view, nullptr);
+            imp.view = VK_NULL_HANDLE;
+        }
+        if (imp.image) {
+            vkDestroyImage(g_presenter.device, imp.image, nullptr);
+            imp.image = VK_NULL_HANDLE;
+        }
+        if (imp.memory) {
+            vkFreeMemory(g_presenter.device, imp.memory, nullptr);
+            imp.memory = VK_NULL_HANDLE;
+        }
+    }
+
     void stopPresenter() {
         if (!g_presenter.running) return;
         g_presenter.running = false;
@@ -199,12 +225,11 @@ namespace {
         g_presenter.paused = false;
         lsfgdisplay::clear();
         vkDeviceWaitIdle(g_presenter.device);
-        for (auto& [key, view] : g_presenter.ahbViews)
-            vkDestroyImageView(g_presenter.device, view, nullptr);
-        g_presenter.ahbViews.clear();
-        for (auto& [key, image] : g_presenter.ahbImages)
-            vkDestroyImage(g_presenter.device, image, nullptr);
-        g_presenter.ahbImages.clear();
+        // Release every cached import (view -> image -> memory). The device
+        // is idle, so no GPU operation is still using them.
+        for (auto& [key, imp] : g_presenter.ahbImports)
+            destroyAhbImport(imp);
+        g_presenter.ahbImports.clear();
         for (uint32_t i = 0; i < g_presenter.swapchainCount; i++) {
             if (g_presenter.swapchainViews[i])
                 vkDestroyImageView(g_presenter.device, g_presenter.swapchainViews[i], nullptr);
@@ -263,6 +288,19 @@ namespace {
             count = caps.maxImageCount;
         count = std::min(count, 8u);
 
+        // The present path writes into swapchain images with vkCmdCopyImage,
+        // so they must be usable as transfer destinations in addition to
+        // color attachments. Not every implementation supports that, so check
+        // the surface capabilities and fail gracefully instead of requesting
+        // unsupported usage.
+        const VkImageUsageFlags desiredUsage =
+            VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+        if ((caps.supportedUsageFlags & desiredUsage) != desiredUsage) {
+            WLOGE("surface does not support transfer-destination swapchain images "
+                   "(supportedUsageFlags=0x%X)", (unsigned)caps.supportedUsageFlags);
+            throw std::runtime_error("swapchain transfer-destination usage unsupported");
+        }
+
         VkSwapchainCreateInfoKHR sci{};
         sci.sType = VK_STRUCTURE_TYPE_SWAPCHAIN_CREATE_INFO_KHR;
         sci.surface = g_presenter.surface;
@@ -271,7 +309,7 @@ namespace {
         sci.imageColorSpace = chosen.colorSpace;
         sci.imageExtent = { width, height };
         sci.imageArrayLayers = 1;
-        sci.imageUsage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
+        sci.imageUsage = desiredUsage;
         sci.imageSharingMode = VK_SHARING_MODE_EXCLUSIVE;
         sci.preTransform = caps.currentTransform;
         sci.compositeAlpha = VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR;
@@ -337,7 +375,13 @@ namespace {
         si.commandBufferCount = 1;
         si.pCommandBuffers = &cmdbuf;
         vkQueueSubmit(g_presenter.queue, 1, &si, g_presenter.presentFence);
-        vkWaitForFences(g_presenter.device, 1, &g_presenter.presentFence, VK_TRUE, 5000000000ull);
+        // The barrier must actually complete before presentLoop reads the
+        // image in GENERAL layout; a timed-out wait means it may not have.
+        VkResult twr = vkWaitForFences(g_presenter.device, 1, &g_presenter.presentFence, VK_TRUE, 5000000000ull);
+        if (twr != VK_SUCCESS) {
+            vkFreeCommandBuffers(g_presenter.device, g_presenter.cmdPool, 1, &cmdbuf);
+            throw std::runtime_error("transitionToGeneral fence wait failed");
+        }
         vkResetFences(g_presenter.device, 1, &g_presenter.presentFence);
         vkFreeCommandBuffers(g_presenter.device, g_presenter.cmdPool, 1, &cmdbuf);
     }
@@ -346,10 +390,10 @@ namespace {
     // (false = cache hit on a previously imported buffer).
     VkImage importAhbLocked(const void* ahb, bool* outFresh = nullptr) {
         uintptr_t key = reinterpret_cast<uintptr_t>(ahb);
-        auto it = g_presenter.ahbImages.find(key);
-        if (it != g_presenter.ahbImages.end()) {
+        auto it = g_presenter.ahbImports.find(key);
+        if (it != g_presenter.ahbImports.end()) {
             if (outFresh) *outFresh = false;
-            return it->second;
+            return it->second.image;
         }
         if (outFresh) *outFresh = true;
 
@@ -417,8 +461,11 @@ namespace {
         VkImageView view = VK_NULL_HANDLE;
         VK_CHECK(vkCreateImageView(g_presenter.device, &vci, nullptr, &view));
 
-        g_presenter.ahbImages[key] = image;
-        g_presenter.ahbViews[key] = view;
+        Presenter::AhbImport imp;
+        imp.image = image;
+        imp.view = view;
+        imp.memory = mem;
+        g_presenter.ahbImports[key] = imp;
         WLOG("imported AHB %p (%dx%d)", ahb, desc.width, desc.height);
         // CRITICAL FIX: transition the imported image to GENERAL now (once),
         // so presentLoop can read it as a copy source.  Reading an image in
@@ -452,15 +499,10 @@ namespace {
             bool freshImport = false;
             auto releasePoppedFrame = [&]() {
                 if (freshImport) {
-                    auto vit = g_presenter.ahbViews.find(frame);
-                    if (vit != g_presenter.ahbViews.end()) {
-                        vkDestroyImageView(g_presenter.device, vit->second, nullptr);
-                        g_presenter.ahbViews.erase(vit);
-                    }
-                    auto iit = g_presenter.ahbImages.find(frame);
-                    if (iit != g_presenter.ahbImages.end()) {
-                        vkDestroyImage(g_presenter.device, iit->second, nullptr);
-                        g_presenter.ahbImages.erase(iit);
+                    auto iit = g_presenter.ahbImports.find(frame);
+                    if (iit != g_presenter.ahbImports.end()) {
+                        destroyAhbImport(iit->second);
+                        g_presenter.ahbImports.erase(iit);
                     }
                 }
                 AHardwareBuffer_release(reinterpret_cast<AHardwareBuffer*>(frame));
@@ -612,19 +654,45 @@ namespace {
                 indices[0] = imageIndex;
                 pi.pSwapchains = chains;
                 pi.pImageIndices = indices;
-                vkQueuePresentKHR(g_presenter.queue, &pi);
+                // A failed present must not be counted as a presented frame.
+                VkResult pr = vkQueuePresentKHR(g_presenter.queue, &pi);
+                if (pr != VK_SUCCESS && pr != VK_SUBOPTIMAL_KHR) {
+                    WLOGE("vkQueuePresentKHR=%d", (int)pr);
+                }
 
                 // Wait (finite timeout) until the GPU is done with this frame
                 // before reusing any of its resources on the next iteration.
+                // Only VK_SUCCESS confirms GPU completion; on any other result
+                // the command buffer and the source AHB may still be in use
+                // and must NOT be released here.
                 VkResult wr = vkWaitForFences(g_presenter.device, 1, &g_presenter.presentFence, VK_TRUE, 3000000000ull);
-                if (wr == VK_SUCCESS) vkResetFences(g_presenter.device, 1, &g_presenter.presentFence);
+                if (wr != VK_SUCCESS) {
+                    // Give the GPU one more bounded chance to finish before
+                    // declaring failure.
+                    wr = vkWaitForFences(g_presenter.device, 1, &g_presenter.presentFence, VK_TRUE, 10000000000ull);
+                }
+                if (wr != VK_SUCCESS) {
+                    // GPU completion could not be confirmed (timeout or device
+                    // loss). Stop presenting and let stopPresenter() tear the
+                    // device down; the frame's import and AHB reference are
+                    // abandoned with the device rather than freed under active
+                    // GPU usage.
+                    WLOGE("present fence not signaled (wait=%d); stopping presenter", (int)wr);
+                    g_presenter.running = false;
+                    if (cmdbuf) {
+                        vkFreeCommandBuffers(g_presenter.device, g_presenter.cmdPool, 1, &cmdbuf);
+                        cmdbuf = VK_NULL_HANDLE;
+                    }
+                    break;
+                }
+                vkResetFences(g_presenter.device, 1, &g_presenter.presentFence);
                 // CRITICAL FIX: free the command buffer NOW that its fence has
                 // signaled (the GPU is done with it).  The old code set
                 // cmdbuf = VK_NULL_HANDLE and never freed it -> per-frame leak
                 // -> pool exhaustion -> null-buffer segfault after ~1.2-2.8s.
                 vkFreeCommandBuffers(g_presenter.device, g_presenter.cmdPool, 1, &cmdbuf);
                 cmdbuf = VK_NULL_HANDLE;
-                // The fence_wait above guarantees the GPU finished reading the
+                // The fence wait above guarantees the GPU finished reading the
                 // source, so the popped frame's reference can go now.
                 releasePoppedFrame();
                 g_presenter.framesPresented++;

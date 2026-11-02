@@ -342,11 +342,16 @@ namespace {
         vkFreeCommandBuffers(g_presenter.device, g_presenter.cmdPool, 1, &cmdbuf);
     }
 
-    VkImage importAhbLocked(const void* ahb) {
+    // *outFresh (when non-null) reports whether this call created a new import
+    // (false = cache hit on a previously imported buffer).
+    VkImage importAhbLocked(const void* ahb, bool* outFresh = nullptr) {
         uintptr_t key = reinterpret_cast<uintptr_t>(ahb);
         auto it = g_presenter.ahbImages.find(key);
-        if (it != g_presenter.ahbImages.end())
+        if (it != g_presenter.ahbImages.end()) {
+            if (outFresh) *outFresh = false;
             return it->second;
+        }
+        if (outFresh) *outFresh = true;
 
         AHardwareBuffer* buffer = const_cast<AHardwareBuffer*>(reinterpret_cast<const AHardwareBuffer*>(ahb));
         AHardwareBuffer_Desc desc;
@@ -438,7 +443,29 @@ namespace {
                 if (g_presenter.paused) std::this_thread::sleep_for(5ms);
                 continue;
             }
-            if (!g_presenter.surfaceValid) continue;
+            // pop() transferred the queue's AHardwareBuffer reference to us.
+            // Release it exactly once on every path below, and only after the
+            // GPU is done with the buffer.  For a freshly imported buffer
+            // (cache miss) the import must be destroyed FIRST, otherwise the
+            // import cache keeps a VkImage bound to freed memory (and a later
+            // allocator pointer reuse would hit a stale cache entry).
+            bool freshImport = false;
+            auto releasePoppedFrame = [&]() {
+                if (freshImport) {
+                    auto vit = g_presenter.ahbViews.find(frame);
+                    if (vit != g_presenter.ahbViews.end()) {
+                        vkDestroyImageView(g_presenter.device, vit->second, nullptr);
+                        g_presenter.ahbViews.erase(vit);
+                    }
+                    auto iit = g_presenter.ahbImages.find(frame);
+                    if (iit != g_presenter.ahbImages.end()) {
+                        vkDestroyImage(g_presenter.device, iit->second, nullptr);
+                        g_presenter.ahbImages.erase(iit);
+                    }
+                }
+                AHardwareBuffer_release(reinterpret_cast<AHardwareBuffer*>(frame));
+            };
+            if (!g_presenter.surfaceValid) { releasePoppedFrame(); continue; }
 
             // Hold this frame's AHB lock for the whole GPU read (import + copy
             // + submit + fence wait) so the producer thread cannot CPU-fill
@@ -452,8 +479,8 @@ namespace {
 
             VkCommandBuffer cmdbuf = VK_NULL_HANDLE;
             try {
-                VkImage srcImage = importAhbLocked(reinterpret_cast<const void*>(frame));
-                if (!srcImage) continue;
+                VkImage srcImage = importAhbLocked(reinterpret_cast<const void*>(frame), &freshImport);
+                if (!srcImage) { releasePoppedFrame(); continue; }
 
                 // Non-blocking acquire: 0 timeout returns VK_TIMEOUT if the
                 // swapchain has no free image right now.  Using UINT64_MAX here
@@ -465,13 +492,15 @@ namespace {
                     g_presenter.imageAcquired, VK_NULL_HANDLE, &imageIndex);
                 if (ar == VK_TIMEOUT || ar == VK_NOT_READY) {
                     std::this_thread::sleep_for(2ms);
+                    releasePoppedFrame();
                     continue;
                 }
                 if (ar == VK_SUBOPTIMAL_KHR || ar == VK_ERROR_OUT_OF_DATE_KHR) {
                     createSwapchain(g_presenter.width, g_presenter.height);
+                    releasePoppedFrame();
                     continue;
                 }
-                if (ar != VK_SUCCESS) { WLOGE("acquire=%d", (int)ar); continue; }
+                if (ar != VK_SUCCESS) { WLOGE("acquire=%d", (int)ar); releasePoppedFrame(); continue; }
 
                 // CRITICAL FIX (was the real ~1.2-2.8s crash): the old code
                 // (a) called vkResetCommandPool EVERY frame while the previous
@@ -494,6 +523,7 @@ namespace {
                 if (aRes != VK_SUCCESS) {
                     WLOGE("vkAllocateCommandBuffers=%d", (int)aRes);
                     std::this_thread::sleep_for(2ms);
+                    releasePoppedFrame();
                     continue;
                 }
                 VkCommandBufferBeginInfo bci{};
@@ -504,6 +534,7 @@ namespace {
                     WLOGE("vkBeginCommandBuffer=%d", (int)bRes);
                     vkFreeCommandBuffers(g_presenter.device, g_presenter.cmdPool, 1, &cmdbuf);
                     cmdbuf = VK_NULL_HANDLE;
+                    releasePoppedFrame();
                     continue;
                 }
 
@@ -559,6 +590,7 @@ namespace {
                 if (vkQueueSubmit(g_presenter.queue, 1, &si, g_presenter.presentFence) != VK_SUCCESS) {
                     vkFreeCommandBuffers(g_presenter.device, g_presenter.cmdPool, 1, &cmdbuf);
                     cmdbuf = VK_NULL_HANDLE;
+                    releasePoppedFrame();
                     continue;
                 }
 
@@ -592,10 +624,14 @@ namespace {
                 // -> pool exhaustion -> null-buffer segfault after ~1.2-2.8s.
                 vkFreeCommandBuffers(g_presenter.device, g_presenter.cmdPool, 1, &cmdbuf);
                 cmdbuf = VK_NULL_HANDLE;
+                // The fence_wait above guarantees the GPU finished reading the
+                // source, so the popped frame's reference can go now.
+                releasePoppedFrame();
                 g_presenter.framesPresented++;
             } catch (const std::exception& e) {
                 WLOGE("present loop: %s", e.what());
                 std::this_thread::sleep_for(10ms);
+                releasePoppedFrame();
             }
             // Free the command buffer on any early-exit path (acquire timeout,
             // swapchain recreate, submit failure, exception) so it is never

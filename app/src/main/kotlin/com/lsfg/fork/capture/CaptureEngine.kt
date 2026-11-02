@@ -391,4 +391,14 @@ class CaptureEngine(
     fun release() {
         stop()
     }
+
+    /** FPS listener contract shared by the ported Root/Shizuku capture engines. */
+    fun interface FpsListener {
+        fun onFpsUpdate(realFps: Float, totalFps: Float)
+    }
+
+    /** Frame-graph (real vs generated fps) listener contract. */
+    fun interface FrameGraphListener {
+        fun onFrameGraphSample(realFps: Float, generatedFps: Float)
+    }
 }

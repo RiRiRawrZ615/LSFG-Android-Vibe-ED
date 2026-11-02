@@ -15,32 +15,140 @@
 #include <stdexcept>
 #include <string>
 #include <utility>
+#include <vector>
 #include <vk>
 
 using namespace lsfgvk;
 
 namespace {
-    /// Create a Vulkan device
+    /// Build the set of device extensions to enable, based strictly on what the
+    /// physical device reports it supports. This is the universal path: we never
+    /// hardcode an assumption that a given extension exists. We query
+    /// vkEnumerateDeviceExtensionProperties and enable only the supported
+    /// entries, then require the ones the pipeline actually depends on.
+    ///
+    /// On Linux the frame exchange is fd-based, so VK_KHR_external_memory_fd and
+    /// VK_KHR_external_semaphore_fd are required (used by Context::exportFds).
+    /// On Android the frame exchange is AHardwareBuffer-based, so
+    /// VK_ANDROID_external_memory_android_hardware_buffer is required (used by
+    /// vkhelper::createImageFromAhb -> vkGetAndroidHardwareBufferPropertiesANDROID).
+    /// Enabling an extension the device lacks is what previously caused a NULL
+    /// device-level function pointer to be called (the SIGSEGV in
+    /// createImageFromAhb).
+    std::vector<const char*> selectDeviceExtensions(
+        const vk::detail::DispatchLoaderDynamic& dld,
+        const vk::PhysicalDevice& physdev,
+        std::function<void(const std::string&)> logCallback
+    ) {
+        const auto supported{physdev.enumerateDeviceExtensionProperties(nullptr, dld)};
+
+        const auto hasSupport{[&](const char* name) {
+            for (const auto& prop : supported)
+                if (std::string(prop.extensionName) == name)
+                    return true;
+            return false;
+        }};
+
+        const auto logExt{[&](const char* name) {
+            if (logCallback)
+                logCallback(std::string("device ext ") + name + ": " +
+                    (hasSupport(name) ? "supported" : "absent"));
+        }};
+
+        std::vector<const char*> enabled;
+
+        // synchronization2 (vkCmdPipelineBarrier2) is core in Vulkan 1.3 but
+        // only an extension (VK_KHR_synchronization2) below 1.3. The pipeline
+        // calls pipelineBarrier2KHR unconditionally (pipeline.cpp), so we must
+        // guarantee the function pointer is non-NULL. This device inherits its
+        // API version from the instance (created at Vulkan 1.2), so on a 1.2
+        // driver synchronization2 is NOT core and the extension is mandatory.
+        // Enabling it on a 1.3 driver is a harmless no-op (it is promoted to
+        // core), so we enable it whenever the physical device reports support
+        // and only *require* it when the device is below 1.3.
+        const auto props{physdev.getProperties(dld)};
+        const bool is13Plus{props.apiVersion >= vk::makeVersion(1, 3, 0)};
+        const bool sync2{hasSupport(vk::KHRSynchronization2ExtensionName)};
+        if (sync2)
+            enabled.push_back(vk::KHRSynchronization2ExtensionName);
+
+        // fd-based external memory / semaphore (Linux frame exchange).
+        const bool memFd{hasSupport(vk::KHRExternalMemoryFdExtensionName)};
+        const bool semFd{hasSupport(vk::KHRExternalSemaphoreFdExtensionName)};
+        if (memFd)
+            enabled.push_back(vk::KHRExternalMemoryFdExtensionName);
+        if (semFd)
+            enabled.push_back(vk::KHRExternalSemaphoreFdExtensionName);
+
+        // AHardwareBuffer external memory (Android frame exchange).
+        const bool ahb{hasSupport(vk::ANDROIDExternalMemoryAndroidHardwareBufferExtensionName)};
+        if (ahb)
+            enabled.push_back(vk::ANDROIDExternalMemoryAndroidHardwareBufferExtensionName);
+
+        logExt(vk::ANDROIDExternalMemoryAndroidHardwareBufferExtensionName);
+        logExt(vk::KHRSynchronization2ExtensionName);
+        logExt(vk::KHRExternalMemoryFdExtensionName);
+        logExt(vk::KHRExternalSemaphoreFdExtensionName);
+        if (logCallback)
+            logCallback(std::string("device apiVersion=") +
+                std::to_string(props.apiVersion >> 22) + "." +
+                std::to_string((props.apiVersion >> 12) & 0x3FF));
+
+        // Require the extensions the pipeline actually depends on. On Android the
+        // AHB extension is mandatory (createImageFromAhb imports the source and
+        // destination buffers through it). The fd extensions are required for the
+        // desktop exportFds path but are optional on Android.
+#if defined(__ANDROID__)
+        if (!ahb) {
+            throw std::runtime_error(
+                "device does not support VK_ANDROID_external_memory_android_hardware_buffer "
+                "(required for AHardwareBuffer import on Android)");
+        }
+#else
+        if (!memFd || !semFd) {
+            throw std::runtime_error(
+                "device is missing VK_KHR_external_memory_fd / VK_KHR_external_semaphore_fd "
+                "(required for fd-based frame exchange)");
+        }
+#endif
+
+        // The pipeline always calls pipelineBarrier2KHR, so synchronization2
+        // must be resolvable. It is core at Vulkan 1.3+; below that the
+        // extension must have been enabled above.
+        if (!is13Plus && !sync2) {
+            throw std::runtime_error(
+                "device is below Vulkan 1.3 and lacks VK_KHR_synchronization2 "
+                "(required by pipelineBarrier2KHR in the framegen pipeline)");
+        }
+
+        return enabled;
+    }
+
+    /// Create a Vulkan device, enabling only the extensions the physical device
+    /// actually reports (see selectDeviceExtensions).
     std::pair<vk::UniqueDevice, vk::Queue> createDevice(
         vk::detail::DispatchLoaderDynamic& dld,
         const vk::PhysicalDevice& physdev,
         uint32_t qfi,
-        bool fp16
+        bool fp16,
+        std::function<void(const std::string&)> logCallback
     ) {
-        constexpr std::array<const char*, 3> EXTENSIONS{
-            vk::KHRSynchronization2ExtensionName,
-            vk::KHRExternalMemoryFdExtensionName,
-            vk::KHRExternalSemaphoreFdExtensionName
-        };
+        auto extensions{selectDeviceExtensions(dld, physdev, logCallback)};
 
-        vk::PhysicalDeviceSynchronization2FeaturesKHR sync2Info{
-            .synchronization2 = vk::True
+        // Request the Vulkan 1.2 core feature set (timeline semaphores, optional
+        // FP16) and the KHR synchronization2 feature. Match the upstream pNext
+        // chain exactly (Synchronization2FeaturesKHR chained to Vulkan12Features).
+        VkPhysicalDeviceSynchronization2FeaturesKHR sync2Info{
+            .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SYNCHRONIZATION_2_FEATURES_KHR,
+            .synchronization2 = VK_TRUE
         };
-        const vk::PhysicalDeviceVulkan12Features vk12Info{
+        vk::PhysicalDeviceVulkan12Features vk12Info{
+            .sType = vk::StructureType::ePhysicalDeviceVulkan12Features,
             .pNext = &sync2Info,
             .shaderFloat16 = fp16,
             .timelineSemaphore = vk::True
         };
+
         const float queuePriority{1.0F}; // Highest priority
         const vk::DeviceQueueCreateInfo queueInfo{
             .queueFamilyIndex = qfi,
@@ -51,10 +159,12 @@ namespace {
             .pNext = &vk12Info,
             .queueCreateInfoCount = 1,
             .pQueueCreateInfos = &queueInfo,
-            .enabledExtensionCount = static_cast<uint32_t>(EXTENSIONS.size()),
-            .ppEnabledExtensionNames = EXTENSIONS.data()
+            .enabledExtensionCount = static_cast<uint32_t>(extensions.size()),
+            .ppEnabledExtensionNames = extensions.empty() ? nullptr : extensions.data()
         };
         auto device{physdev.createDeviceUnique(deviceInfo, nullptr, dld)};
+        // Populate device-level function pointers (including the AHB extension's
+        // vkGetAndroidHardwareBufferPropertiesANDROID) from the created device.
         dld.init(*device);
 
         return{
@@ -88,7 +198,7 @@ Instance::Instance(
     )};
     const bool fp16{allowFP16 && vkhelper::checkHalfPrecisionSupport(*dld, physdev)};
 
-    auto [device, queue] = createDevice(*dld, physdev, qfi, fp16);
+    auto [device, queue] = createDevice(*dld, physdev, qfi, fp16, logCallback);
 
     // Construct instance
     ShaderLibrary library{

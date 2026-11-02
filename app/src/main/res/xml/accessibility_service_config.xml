@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Minimal accessibility config for the ported LsfgAccessibilityService.
+     The fork uses it for foreground-package awareness only (the reference
+     used it to drive its Automatic Overlay; the service is a stub here). -->
+<accessibility-service xmlns:android="http://schemas.android.com/apk/res/android"
+    android:accessibilityEventTypes="typeWindowStateChanged"
+    android:accessibilityFeedbackType="feedbackGeneric"
+    android:accessibilityFlags="flagDefault"
+    android:canRetrieveWindowContent="false"
+    android:description="@string/accessibility_service_label"
+    android:notificationTimeout="100" />

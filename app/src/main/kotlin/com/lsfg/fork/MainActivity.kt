@@ -41,6 +41,10 @@ import com.lsfg.fork.ui.TestScreen
 
 class MainActivity : ComponentActivity() {
 
+    companion object {
+        private const val SHIZUKU_PERM_REQUEST = 1001
+    }
+
     private val session: SessionManager get() = SessionManager.shared
 
     /** Re-enter the start flow after an async permission grant. */
@@ -152,7 +156,15 @@ class MainActivity : ComponentActivity() {
             return
         }
 
-        // (3) Nonroot needs MediaProjection consent (one-time system dialog).
+        // (3) Shizuku mode needs the Shizuku API permission (one-time dialog).
+        //     Must be obtained BEFORE the session starts.
+        if (s.captureMode == "shizuku" && !isShizukuReady()) {
+            Log.i(SessionManager.TAG, "requesting Shizuku permission")
+            requestShizukuPermission()
+            return
+        }
+
+        // (4) Nonroot needs MediaProjection consent (one-time system dialog).
         //     Must be obtained BEFORE the session starts (bug 2).
         if (s.captureMode == "nonroot" && SessionManager.pendingProjectionData == null) {
             Log.i(SessionManager.TAG, "requesting MediaProjection consent")
@@ -176,7 +188,7 @@ class MainActivity : ComponentActivity() {
             return
         }
 
-        // (4) All permissions in place. Attach the overlay while the app is in
+        // (5) All permissions in place. Attach the overlay while the app is in
         //     the FOREGROUND (most reliable on MIUI), launch the target, then
         //     hand off to the foreground service (keep-alive + controls).
         proceedToStart(s)
@@ -239,6 +251,49 @@ class MainActivity : ComponentActivity() {
         } catch (t: Throwable) {
             Log.e(SessionManager.TAG, "startService failed: ${t.message}")
             toast("Service start failed: ${t.message}")
+        }
+    }
+
+    // ==================================================================
+    //  Shizuku permission (dev.rikka.shizuku API, ported reference flow)
+    // ==================================================================
+
+    private fun isShizukuReady(): Boolean = try {
+        rikka.shizuku.Shizuku.pingBinder() &&
+            rikka.shizuku.Shizuku.checkSelfPermission() == PackageManager.PERMISSION_GRANTED
+    } catch (_: Throwable) {
+        false
+    }
+
+    private fun requestShizukuPermission() {
+        try {
+            if (!rikka.shizuku.Shizuku.pingBinder()) {
+                toast("Shizuku not running - start the Shizuku app (or use Root mode)")
+                Log.w(SessionManager.TAG, "Shizuku pingBinder failed, proceeding (fallback path)")
+                proceedToStart(SessionManager.shared.state.value)
+                return
+            }
+            val listener = object : rikka.shizuku.Shizuku.OnRequestPermissionResultListener {
+                override fun onRequestPermissionResult(requestCode: Int, state: Int) {
+                    if (requestCode != SHIZUKU_PERM_REQUEST) return
+                    Log.i(SessionManager.TAG, "Shizuku permission state=$state")
+                    rikka.shizuku.Shizuku.removeRequestPermissionResultListener(this)
+                    runOnUiThread {
+                        if (state == PackageManager.PERMISSION_GRANTED) {
+                            toast("Shizuku granted. Starting...")
+                        } else {
+                            toast("Shizuku permission: state=$state (continuing)")
+                        }
+                        if (!session.isRunning()) startFlow()
+                    }
+                }
+            }
+            rikka.shizuku.Shizuku.addRequestPermissionResultListener(listener)
+            rikka.shizuku.Shizuku.requestPermission(SHIZUKU_PERM_REQUEST)
+        } catch (t: Throwable) {
+            Log.w(SessionManager.TAG, "Shizuku requestPermission: ${t.message}")
+            toast("Shizuku request failed: ${t.message}")
+            proceedToStart(SessionManager.shared.state.value)
         }
     }
 

@@ -3,6 +3,7 @@ package com.lsfg.fork.framegen
 /** JNI bridge for the LSFG v3_1 compute pipeline (framegen). */
 object FramegenBridge {
 
+    private external fun nativeSetCacheDir(dir: String)
     private external fun nativeInit(dllPath: String, allowFP16: Boolean): Long
     private external fun nativeCreateSession(
         handle: Long,
@@ -26,6 +27,15 @@ object FramegenBridge {
 
     var loaded: Boolean = false
         private set
+
+    /**
+     * Set the pipeline-cache directory BEFORE init. Must be a directory the
+     * process can always write to (app internal files dir on Android).
+     * Never /tmp/ (read-only tmpfs on HyperOS even with root).
+     */
+    fun setCacheDir(dir: String) {
+        try { nativeSetCacheDir(dir) } catch (t: Throwable) { println("FramegenBridge.setCacheDir: $t") }
+    }
 
     @Synchronized
     fun init(dllPath: String, allowFP16: Boolean): Boolean {

@@ -25,6 +25,12 @@
 
 #if defined(__ANDROID__)
 #include <android/hardware_buffer.h>
+#include <android/log.h>
+#include <fcntl.h>    // fcntl, F_DUPFD_CLOEXEC for safeExportedFd
+#include <unistd.h>   // close
+#define VKLOG(...) __android_log_print(ANDROID_LOG_WARN, "lsfg-vkhelper", __VA_ARGS__)
+#else
+#define VKLOG(...) do {} while (0)
 #endif
 
 /* Device initialization */
@@ -329,10 +335,11 @@ vk::UniqueImage vkhelper::createImage(
     vk::Format format,
     uint32_t layers,
     vk::ImageUsageFlags usage,
-    bool external
+    bool external,
+    vk::ExternalMemoryHandleTypeFlagBits externalType
 ) {
     const vk::ExternalMemoryImageCreateInfo externalInfo{
-        .handleTypes = vk::ExternalMemoryHandleTypeFlagBits::eOpaqueFd
+        .handleTypes = externalType
     };
     const vk::ImageCreateInfo imageInfo{
         .pNext = external ? &externalInfo : nullptr,
@@ -352,6 +359,66 @@ vk::UniqueImage vkhelper::createImage(
 }
 
 #if defined(__ANDROID__)
+bool vkhelper::supportsAhbExport(
+    const vk::detail::DispatchLoaderDynamic& dld,
+    const vk::PhysicalDevice& physdev,
+    vk::Extent2D extent,
+    vk::Format format,
+    vk::ImageUsageFlags usage
+) {
+    // Ask the driver whether this exact image configuration is exportable as an
+    // AHardwareBuffer. Export and import are reported separately and a driver can
+    // support import without export, so this is queried rather than assumed. Any
+    // failure simply means "stay on the opaque-fd handle type".
+    (void)extent;
+    try {
+        // Raw C API rather than a vulkan.hpp convenience member: the vendored
+        // header set does not expose getExternalImageFormatProperties(), and the
+        // struct chain is unambiguous here.
+        const auto getFmt2{dld.vkGetPhysicalDeviceImageFormatProperties2};
+        if (!getFmt2)
+            return false;
+
+        VkPhysicalDeviceExternalImageFormatInfo externalInfo{};
+        externalInfo.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTERNAL_IMAGE_FORMAT_INFO;
+        externalInfo.handleType =
+            VK_EXTERNAL_MEMORY_HANDLE_TYPE_ANDROID_HARDWARE_BUFFER_BIT_ANDROID;
+
+        VkPhysicalDeviceImageFormatInfo2 formatInfo{};
+        formatInfo.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_IMAGE_FORMAT_INFO_2;
+        formatInfo.pNext = &externalInfo;
+        formatInfo.format = static_cast<VkFormat>(format);
+        formatInfo.type = VK_IMAGE_TYPE_2D;
+        formatInfo.tiling = VK_IMAGE_TILING_OPTIMAL;
+        formatInfo.usage = static_cast<VkImageUsageFlags>(usage);
+
+        VkExternalImageFormatProperties externalProps{};
+        externalProps.sType = VK_STRUCTURE_TYPE_EXTERNAL_IMAGE_FORMAT_PROPERTIES;
+
+        VkImageFormatProperties2 props{};
+        props.sType = VK_STRUCTURE_TYPE_IMAGE_FORMAT_PROPERTIES_2;
+        props.pNext = &externalProps;
+
+        const VkResult result{getFmt2(
+            static_cast<VkPhysicalDevice>(physdev), &formatInfo, &props)};
+        if (result != VK_SUCCESS) {
+            VKLOG("supportsAhbExport: format query result=%d", static_cast<int>(result));
+            return false;
+        }
+        const bool exportable{
+            (externalProps.externalMemoryProperties.externalMemoryFeatures &
+             VK_EXTERNAL_MEMORY_FEATURE_EXPORTABLE_BIT) != 0
+        };
+        VKLOG("supportsAhbExport: exportable=%d (features=0x%x)",
+            exportable ? 1 : 0,
+            static_cast<unsigned>(externalProps.externalMemoryProperties.externalMemoryFeatures));
+        return exportable;
+    } catch (const std::exception& e) {
+        VKLOG("supportsAhbExport query failed: %s", e.what());
+        return false;
+    }
+}
+
 vk::UniqueImage vkhelper::createImageFromAhb(
     const vk::detail::DispatchLoaderDynamic& dld,
     const vk::Device& device,
@@ -452,16 +519,250 @@ vk::UniqueImage vkhelper::createImageFromAhb(
     const vk::ImportAndroidHardwareBufferInfoANDROID importInfo{
         .buffer = ahbMutable
     };
+    // Imported-AHardwareBuffer special case: the allocation size must cover the
+    // BUFFER's allocation, not merely the image's memory requirements.
+    //
+    // The image's requirements describe the image's own view of the memory; the
+    // imported buffer may be larger (gralloc pads and aligns, and the buffer is
+    // sized for the full surface while the Vulkan image may be smaller).
+    // Allocating only requirements.size under-sizes the import, so the driver
+    // cannot map the whole buffer and the image ends up mis-bound. Adreno then
+    // dereferences null when it resolves the image for the first copy that
+    // touches it: SIGSEGV/SEGV_MAPERR at a small fixed offset inside
+    // vkCmdCopyImage/vkCmdBlitImage. Take the larger of the two so the import is
+    // always backed by the buffer's real allocation.
+    const vk::DeviceSize importSize{
+        std::max<vk::DeviceSize>(requirements.size, props.allocationSize)
+    };
+    VKLOG("AHB import ahb=%p extent=%ux%u imageReq=%llu bufAlloc=%llu using=%llu "
+          "memTypeBits(img=%u buf=%u) chosen=%u",
+        ahb, extent.width, extent.height,
+        static_cast<unsigned long long>(requirements.size),
+        static_cast<unsigned long long>(props.allocationSize),
+        static_cast<unsigned long long>(importSize),
+        static_cast<unsigned>(requirements.memoryTypeBits),
+        static_cast<unsigned>(props.memoryTypeBits),
+        memoryTypeIndex);
     const vk::MemoryAllocateInfo allocInfo{
         .pNext = &importInfo,
-        .allocationSize = requirements.size,
+        .allocationSize = importSize,
+        .memoryTypeIndex = memoryTypeIndex
+    };
+    // OWNERSHIP: release the allocation so it is NOT freed when this function
+    // returns.
+    //
+    // Returning a UniqueImage while letting the UniqueDeviceMemory die at scope
+    // exit makes vkFreeMemory run immediately, leaving the returned image bound
+    // to freed memory. Every later use of that image (the copy that writes the
+    // generated frame into it, the copy that reads it back out) then traps
+    // inside the driver: Adreno dereferences the now-dangling backing store and
+    // dies with SIGSEGV/SEGV_MAPERR at a fixed offset. That was the real cause of
+    // the blit/copy crash - switching blit to copy changed the entry point but
+    // not the fault, because the imported image was already dead.
+    //
+    // The caller is responsible for destroying the memory after the image. See
+    // the "two-phase" note on createImageFromAhbAlloc, which hands the caller
+    // that allocation explicitly. This raw-handle entry point keeps the old
+    // signature for the one-shot source import (writeSourceLayer), which
+    // destroys the image itself and deliberately leaks the bound memory for the
+    // life of the process rather than risk a use-after-free: one small
+    // allocation per capture buffer, reclaimed by the OS at process exit.
+    auto allocation{device.allocateMemoryUnique(allocInfo, nullptr, dld)};
+
+    device.bindImageMemory(*image, *allocation, 0, dld);
+
+    (void)allocation.release();
+    return image;
+}
+
+std::pair<vk::UniqueImage, vk::UniqueDeviceMemory> vkhelper::createImageFromAhbAlloc(
+    const vk::detail::DispatchLoaderDynamic& dld,
+    const vk::Device& device,
+    const void* buffer,
+    vk::ImageUsageFlags usage
+) {
+    // Two-phase variant: returns the imported image AND the memory allocation
+    // that backs it, so the caller can keep both alive for as long as the image
+    // is used. Destroying this memory while the image is still in use corrupts
+    // GPU state (see the ownership note above).
+    const auto* ahb{static_cast<const AHardwareBuffer*>(buffer)};
+    AHardwareBuffer_Desc desc{};
+    AHardwareBuffer_describe(ahb, &desc);
+    if (desc.width == 0 || desc.height == 0)
+        throw std::runtime_error("AHardwareBuffer_describe returned an empty buffer");
+
+    vk::Format format = vk::Format::eR8G8B8A8Unorm;
+    switch (desc.format) {
+        case AHARDWAREBUFFER_FORMAT_R8G8B8A8_UNORM:
+            format = vk::Format::eR8G8B8A8Unorm;
+            break;
+        case AHARDWAREBUFFER_FORMAT_R10G10B10A2_UNORM:
+            format = vk::Format::eA2B10G10R10UnormPack32;
+            break;
+        case AHARDWAREBUFFER_FORMAT_R16G16B16A16_FLOAT:
+            format = vk::Format::eR16G16B16A16Sfloat;
+            break;
+        case AHARDWAREBUFFER_FORMAT_R8G8B8_UNORM:
+            format = vk::Format::eR8G8B8Unorm;
+            break;
+        default:
+            break;
+    }
+
+    const vk::Extent2D extent{
+        static_cast<uint32_t>(desc.width),
+        static_cast<uint32_t>(desc.height)
+    };
+
+    auto getAhbProps{dld.vkGetAndroidHardwareBufferPropertiesANDROID};
+    if (!getAhbProps) {
+        throw std::runtime_error(
+            "device lacks vkGetAndroidHardwareBufferPropertiesANDROID; enable "
+            "VK_ANDROID_external_memory_android_hardware_buffer on the device");
+    }
+
+    // Query the buffer properties BEFORE creating the image, and ask for the
+    // FORMAT properties too via pNext.
+    //
+    // Valid usage requires that, for a dedicated AHB import, the image's format
+    // is either VK_FORMAT_UNDEFINED or exactly the format the driver reports in
+    // VkAndroidHardwareBufferFormatPropertiesANDROID::format. Our previous code
+    // passed a hardcoded guess from a local switch, which can disagree with what
+    // the driver reports and makes the import invalid. Feeding the driver's own
+    // answer back into vkCreateImage is the conformant ordering.
+    VkAndroidHardwareBufferFormatPropertiesANDROID fmtProps{};
+    fmtProps.sType = VK_STRUCTURE_TYPE_ANDROID_HARDWARE_BUFFER_FORMAT_PROPERTIES_ANDROID;
+    VkAndroidHardwareBufferPropertiesANDROID props{};
+    props.sType = VK_STRUCTURE_TYPE_ANDROID_HARDWARE_BUFFER_PROPERTIES_ANDROID;
+    props.pNext = &fmtProps;
+    if (getAhbProps(static_cast<VkDevice>(device), ahb, &props) != VK_SUCCESS)
+        throw std::runtime_error("vkGetAndroidHardwareBufferPropertiesANDROID failed");
+
+    if (fmtProps.format != VK_FORMAT_UNDEFINED) {
+        format = static_cast<vk::Format>(fmtProps.format);
+    } else {
+        // Undefined here means an implementation-defined external format (typically
+        // YCbCr camera/video buffers) which needs a VkSamplerYcbcrConversion. Our
+        // local switch handles the plain RGBA/RGB cases we allocate ourselves.
+        VKLOG("AHB import: driver reported VK_FORMAT_UNDEFINED (externalFormat=0x%llx); "
+              "falling back to local guess %d",
+            static_cast<unsigned long long>(fmtProps.externalFormat),
+            static_cast<int>(format));
+    }
+
+    // Create the image DECLARING the AHardwareBuffer external handle type.
+    //
+    // This is required, and was the actual root cause of the Adreno crash. An
+    // image created without VkExternalMemoryImageCreateInfo reports generic
+    // memory requirements, so vkGetImageMemoryRequirements offers only the
+    // driver's default memory type. The AHardwareBuffer, however, is only
+    // importable into specific memory types. Measured on this device:
+    //
+    //   imageReq=9613312 bufAlloc=9515008
+    //   memTypeBits(img=1 buf=18) -> intersection EMPTY (1 & 18 == 0)
+    //   memTypeBits(img=1 buf=2)  -> intersection EMPTY (1 & 2  == 0)
+    //
+    // The old code fell back to the image's own bits when the intersection was
+    // empty, binding the buffer to a memory type it does not support. The image
+    // then resolved to nothing and the first copy that touched it trapped in
+    // the driver (SIGSEGV/SEGV_MAPERR at a small fixed offset).
+    //
+    // NOTE: the handle type here must be ANDROID_HARDWARE_BUFFER. This is NOT
+    // the OPAQUE_FD path that an earlier comment warned about; AHB gralloc memory
+    // is not fd-exportable, but it is importable as an AHardwareBuffer handle.
+    // Declaring it lets the driver report memory types that are actually
+    // compatible with the buffer, so a valid intersection exists.
+    const vk::ExternalMemoryImageCreateInfo ahbExternalInfo{
+        .handleTypes = vk::ExternalMemoryHandleTypeFlagBits::eAndroidHardwareBufferANDROID
+    };
+    const vk::ImageCreateInfo ahbImageInfo{
+        .pNext = &ahbExternalInfo,
+        .imageType = vk::ImageType::e2D,
+        .format = format,
+        .extent = {
+            .width = extent.width,
+            .height = extent.height,
+            .depth = 1
+        },
+        .mipLevels = 1,
+        .arrayLayers = 1,
+        .samples = vk::SampleCountFlagBits::e1,
+        .usage = usage
+    };
+    auto image{device.createImageUnique(ahbImageInfo, nullptr, dld)};
+
+    const auto requirements{device.getImageMemoryRequirements(*image, dld)};
+
+    // The memory type must be BOTH usable by the image and supported by the AHB.
+    //
+    // The previous code silently fell back to the image's own memoryTypeBits when
+    // the intersection was empty, which deliberately bound the buffer to a memory
+    // type it does not support. That produced a memory object the driver could not
+    // resolve, and the first copy touching the image trapped in the driver. Fail
+    // loudly instead: an empty intersection means the import cannot be done
+    // correctly at all, and a clear error is strictly better than a GPU fault.
+    const uint32_t usable{
+        static_cast<uint32_t>(requirements.memoryTypeBits) & props.memoryTypeBits
+    };
+    if (usable == 0) {
+        throw std::runtime_error(
+            "AHB import: no memory type is both image-usable (" +
+            std::to_string(static_cast<unsigned>(requirements.memoryTypeBits)) +
+            ") and AHB-compatible (" +
+            std::to_string(static_cast<unsigned>(props.memoryTypeBits)) + ")");
+    }
+    uint32_t memoryTypeIndex = 0;
+    for (uint32_t i = 0; i < 64; ++i) {
+        if (usable & (1u << i)) {
+            memoryTypeIndex = i;
+            break;
+        }
+    }
+
+    auto* ahbMutable{const_cast<AHardwareBuffer*>(ahb)};
+
+    // DEDICATED ALLOCATION IS REQUIRED HERE.
+    //
+    // VkImportAndroidHardwareBufferInfoANDROID is one of the import paths that
+    // requires the memory to be a dedicated allocation: without
+    // VkMemoryDedicatedAllocateInfo naming this image, the pNext chain does not
+    // describe a dedicated import, and the spec then demands the buffer be a
+    // BLOB with AHARDWAREBUFFER_USAGE_GPU_DATA_BUFFER, which ours is not. Every
+    // reference implementation (upstream lsfg-vk-pipeline, lsfg-vk-cli, and the
+    // LSFG-Android AHB bridges) chains the dedicated struct in. We did not.
+    const vk::MemoryDedicatedAllocateInfo dedicatedInfo{
+        .image = *image
+    };
+    const vk::ImportAndroidHardwareBufferInfoANDROID importInfo{
+        .pNext = &dedicatedInfo,
+        .buffer = ahbMutable
+    };
+    // allocationSize must be EXACTLY the value the driver returned from
+    // vkGetAndroidHardwareBufferPropertiesANDROID for this buffer. The previous
+    // code passed max(imageRequirements.size, props.allocationSize) hoping the
+    // larger of the two would be safer; the spec's requirement is equality, so a
+    // mismatch is an invalid import even when the number is bigger.
+    const vk::DeviceSize importSize{props.allocationSize};
+    VKLOG("AHB import ahb=%p extent=%ux%u imageReq=%llu bufAlloc=%llu using=%llu "
+          "memTypeBits(img=%u buf=%u chosen=0x%x) -> %u dedicated=yes",
+        ahb, extent.width, extent.height,
+        static_cast<unsigned long long>(requirements.size),
+        static_cast<unsigned long long>(props.allocationSize),
+        static_cast<unsigned long long>(importSize),
+        static_cast<unsigned>(requirements.memoryTypeBits),
+        static_cast<unsigned>(props.memoryTypeBits),
+        static_cast<unsigned>(usable),
+        memoryTypeIndex);
+    const vk::MemoryAllocateInfo allocInfo{
+        .pNext = &importInfo,
+        .allocationSize = importSize,
         .memoryTypeIndex = memoryTypeIndex
     };
     auto allocation{device.allocateMemoryUnique(allocInfo, nullptr, dld)};
 
     device.bindImageMemory(*image, *allocation, 0, dld);
 
-    return image;
+    return { std::move(image), std::move(allocation) };
 }
 #endif
 
@@ -713,11 +1014,47 @@ void vkhelper::blitImage(
             { static_cast<int32_t>(extent.width), static_cast<int32_t>(extent.height), 1 }
         }}
     };
-    cmdbuf.blitImage(
+    // Prefer vkCmdCopyImage when the source and destination have identical
+    // extents and formats.
+    //
+    // vkCmdBlitImage is only valid when the DESTINATION advertises
+    // VK_FORMAT_FEATURE_BLIT_DST_BIT, and gralloc-backed AHardwareBuffer images
+    // generally do not (their optimized layouts are exposed as sampled /
+    // transfer usages, not as blit targets). Requesting a blit into such an
+    // image on Adreno does not fail cleanly: the driver dereferences a null
+    // internal resource at offset 0x80 inside vkCmdBlitImage2 and the process
+    // dies with SIGSEGV (SEGV_MAPERR, fault addr 0x80). That was the crash in
+    // nativeAcquireToDst -> vkhelper::blitImage -> vkCmdBlitImage.
+    //
+    // vkCmdCopyImage has no BILT_DST requirement: it needs only TRANSFER_SRC on
+    // the source and TRANSFER_DST on the destination, which both images already
+    // declare. The WSI presenter's present path copies into AHB-imported images
+    // with vkCmdCopyImage and works on this device, so this matches the one
+    // proven-good path rather than inventing a new one.
+    //
+    // A copy is also the correct operation here: every call site copies between
+    // matching extents at offset zero (source AHB -> pipeline input layer, and
+    // pipeline output -> destination AHB). Scaling is not requested, so the
+    // blit's sampling behaviour buys nothing and only risks the invalid-usage
+    // path above. If the extents ever differ, fall back to the blit.
+    //
+    // Note: the copy region must cover whole texels, so the extent is clamped to
+    // the smaller of the two images (defensive; callers pass matching sizes).
+    const vk::ImageCopy copyInfo{
+        .srcSubresource = blitInfo.srcSubresource,
+        .srcOffset = { 0, 0, 0 },
+        .dstSubresource = blitInfo.dstSubresource,
+        .dstOffset = { 0, 0, 0 },
+        .extent = {
+            .width = extent.width,
+            .height = extent.height,
+            .depth = 1
+        }
+    };
+    cmdbuf.copyImage(
         srcImage, vk::ImageLayout::eGeneral,
         dstImage, vk::ImageLayout::eGeneral,
-        blitInfo,
-        vk::Filter::eNearest,
+        copyInfo,
         dld
     );
 }
@@ -763,6 +1100,49 @@ int vkhelper::exportMemoryFd(
         .handleType = vk::ExternalMemoryHandleTypeFlagBits::eOpaqueFd
     };
     return device.getMemoryFdKHR(fdInfo, dld);
+}
+
+#if defined(__ANDROID__)
+AHardwareBuffer* vkhelper::exportMemoryAhb(
+    const vk::detail::DispatchLoaderDynamic& dld,
+    const vk::Device& device,
+    const vk::DeviceMemory& memory
+) {
+    // Prefer the dispatch-loader pointer and fall back to the raw entry point, so
+    // this cannot null-call if the function was not resolved into the loader
+    // (exactly the class of bug that produced an earlier SIGSEGV at 0x0 here).
+    const auto getAhb{dld.vkGetMemoryAndroidHardwareBufferANDROID};
+    AHardwareBuffer* buffer{nullptr};
+    VkMemoryGetAndroidHardwareBufferInfoANDROID info{};
+    info.sType = VK_STRUCTURE_TYPE_MEMORY_GET_ANDROID_HARDWARE_BUFFER_INFO_ANDROID;
+    info.memory = static_cast<VkDeviceMemory>(memory);
+
+    const VkResult result{getAhb
+        ? getAhb(static_cast<VkDevice>(device), &info, &buffer)
+        : ::vkGetMemoryAndroidHardwareBufferANDROID(
+              static_cast<VkDevice>(device), &info, &buffer)};
+    if (result != VK_SUCCESS || !buffer) {
+        VKLOG("exportMemoryAhb failed: result=%d buffer=%p", static_cast<int>(result), buffer);
+        return nullptr;
+    }
+    // The spec requires a NEW reference to be acquired here; the caller owns it.
+    return buffer;
+}
+#endif
+
+int vkhelper::safeExportedFd(int fd) {
+    // Descriptors 0/1/2 belong to the process's std streams. If a driver returned
+    // one, dup it out of the way and close the original, so later code never
+    // closes a descriptor the rest of the process expects to own. Closing a
+    // descriptor in the 0-2 range is what trips Android's fdsan into aborting.
+    if (fd < 0)
+        return -1;
+    if (fd > 2)
+        return fd;
+    const int moved{::fcntl(fd, F_DUPFD_CLOEXEC, 3)};
+    if (moved >= 0)
+        ::close(fd);
+    return moved;
 }
 
 int vkhelper::exportSemaphoreFd(

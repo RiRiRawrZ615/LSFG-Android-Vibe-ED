@@ -161,6 +161,20 @@ namespace {
         };
         std::map<uintptr_t, AhbImport> ahbImports;
 
+        // FD-based frame exchange (used instead of ahbImports when the framegen
+        // pipeline hands us an exported fd). Importing the pipeline's own image
+        // avoids writing into an app-allocated AHardwareBuffer, which faults
+        // inside Adreno's copy helper (SIGSEGV at fault addr 0x80) and forces a
+        // CPU lock of that AHB which double-closes an fd under Mesa's fallback
+        // gralloc.
+        VkImage dstImage{};
+        VkDeviceMemory dstMemory{};
+        uint32_t dstWidth{0};
+        uint32_t dstHeight{0};
+        bool dstReady{false};
+        // Whether VK_KHR_external_memory_fd was enabled (needed by the fd import).
+        bool hasMemoryFd{false};
+
         ANativeWindow* window{nullptr};
         uint32_t width{0};
         uint32_t height{0};
@@ -305,6 +319,24 @@ namespace {
         g_presenter.queue = VK_NULL_HANDLE;
     }
 
+    /// Release the imported pipeline destination image (fd mode), if any.
+    void destroyDstImport() {
+        g_presenter.dstReady = false;
+        if (g_presenter.device) {
+            if (g_presenter.dstImage) {
+                vkDestroyImage(g_presenter.device, g_presenter.dstImage, nullptr);
+                g_presenter.dstImage = VK_NULL_HANDLE;
+            }
+            if (g_presenter.dstMemory) {
+                vkFreeMemory(g_presenter.device, g_presenter.dstMemory, nullptr);
+                g_presenter.dstMemory = VK_NULL_HANDLE;
+            }
+        } else {
+            g_presenter.dstImage = VK_NULL_HANDLE;
+            g_presenter.dstMemory = VK_NULL_HANDLE;
+        }
+    }
+
     void stopPresenter() {
         // g_initLock serializes start/stop; the present thread never calls
         // stopPresenter, so there is no self-join and no double cleanup.
@@ -328,7 +360,11 @@ namespace {
                     g_presenter.gpuFailure = true;
                 }
             }
+            // Drop the fd-mode destination import before the device goes away.
+            destroyDstImport();
             teardownVulkanResources();
+        } else {
+            destroyDstImport();
         }
         g_presenter.framesPresented = 0;
         g_presenter.surfaceValid = false;
@@ -600,12 +636,146 @@ namespace {
         return image;
     }
 
+    /// Copy the pipeline-owned destination image into the swapchain and present.
+    ///
+    /// This is deliberately the same command sequence as the proven AHB path
+    /// below (acquire -> barrier -> copy -> barrier -> submit -> present), with
+    /// the source being the imported pipeline image instead of an AHB import.
+    /// It is throttled to targetFps because the pipeline produces frames on our
+    /// own dispatch cadence rather than one-per-pop.
+    void presentFromFd() {
+        using namespace std::chrono_literals;
+        const auto frameBudget = std::chrono::duration<double>(
+            1.0 / static_cast<double>(g_presenter.targetFps > 1.0f ? g_presenter.targetFps : 60.0f));
+        static auto lastPresent = std::chrono::steady_clock::now();
+        const auto now = std::chrono::steady_clock::now();
+        if (now - lastPresent < frameBudget) {
+            std::this_thread::sleep_for(1ms);
+            return;
+        }
+        lastPresent = now;
+
+        if (!g_presenter.surfaceValid || !g_presenter.swapchain) {
+            std::this_thread::sleep_for(2ms);
+            return;
+        }
+
+        uint32_t imageIndex = 0;
+        VkResult ar = vkAcquireNextImageKHR(g_presenter.device, g_presenter.swapchain, 0,
+                                            g_presenter.imageAcquired, VK_NULL_HANDLE, &imageIndex);
+        if (ar == VK_TIMEOUT || ar == VK_NOT_READY) {
+            std::this_thread::sleep_for(2ms);
+            return;
+        }
+        if (ar == VK_SUBOPTIMAL_KHR || ar == VK_ERROR_OUT_OF_DATE_KHR) {
+            createSwapchain(g_presenter.width, g_presenter.height);
+            return;
+        }
+        if (ar != VK_SUCCESS) {
+            WLOGE("fd mode acquire=%d", (int)ar);
+            std::this_thread::sleep_for(2ms);
+            return;
+        }
+
+        VkCommandBuffer cmdbuf = VK_NULL_HANDLE;
+        VkCommandBufferAllocateInfo cabi{};
+        cabi.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
+        cabi.commandPool = g_presenter.cmdPool;
+        cabi.commandBufferCount = 1;
+        if (vkAllocateCommandBuffers(g_presenter.device, &cabi, &cmdbuf) != VK_SUCCESS) {
+            std::this_thread::sleep_for(2ms);
+            return;
+        }
+        VkCommandBufferBeginInfo bci{};
+        bci.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+        bci.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+        if (vkBeginCommandBuffer(cmdbuf, &bci) != VK_SUCCESS) {
+            vkFreeCommandBuffers(g_presenter.device, g_presenter.cmdPool, 1, &cmdbuf);
+            std::this_thread::sleep_for(2ms);
+            return;
+        }
+
+        VkImageMemoryBarrier ib{};
+        ib.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+        ib.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+        ib.newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+        ib.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        ib.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        ib.srcAccessMask = 0;
+        ib.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+        ib.image = g_presenter.swapchainImages[imageIndex];
+        ib.subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
+        vkCmdPipelineBarrier(cmdbuf, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+                             VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr, 1, &ib);
+
+        // Clamp to the smaller of the pipeline image and the swapchain so a
+        // mismatch (rotation/resolution change) cannot read out of bounds.
+        const uint32_t cw = std::min(g_presenter.dstWidth, g_presenter.width);
+        const uint32_t ch = std::min(g_presenter.dstHeight, g_presenter.height);
+        VkImageCopy region{};
+        region.srcSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 };
+        region.dstSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 };
+        region.extent = { cw, ch, 1 };
+        vkCmdCopyImage(cmdbuf, g_presenter.dstImage, VK_IMAGE_LAYOUT_GENERAL,
+                       g_presenter.swapchainImages[imageIndex],
+                       VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region);
+
+        ib.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+        ib.newLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
+        ib.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+        ib.dstAccessMask = 0;
+        vkCmdPipelineBarrier(cmdbuf, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                             VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, 0, 0, nullptr, 0, nullptr, 1, &ib);
+        vkEndCommandBuffer(cmdbuf);
+
+        VkPipelineStageFlags waitStage = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
+        VkSubmitInfo si{};
+        si.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+        si.waitSemaphoreCount = 1;
+        si.pWaitSemaphores = &g_presenter.imageAcquired;
+        si.pWaitDstStageMask = &waitStage;
+        si.commandBufferCount = 1;
+        si.pCommandBuffers = &cmdbuf;
+        if (vkQueueSubmit(g_presenter.queue, 1, &si, g_presenter.presentFence) != VK_SUCCESS) {
+            vkFreeCommandBuffers(g_presenter.device, g_presenter.cmdPool, 1, &cmdbuf);
+            std::this_thread::sleep_for(2ms);
+            return;
+        }
+
+        VkPresentInfoKHR pi{};
+        pi.sType = VK_STRUCTURE_TYPE_PRESENT_INFO_KHR;
+        pi.waitSemaphoreCount = 0;
+        pi.swapchainCount = 1;
+        pi.pSwapchains = &g_presenter.swapchain;
+        pi.pImageIndices = &imageIndex;
+        VkResult pr = vkQueuePresentKHR(g_presenter.queue, &pi);
+        if (pr == VK_ERROR_OUT_OF_DATE_KHR || pr == VK_SUBOPTIMAL_KHR)
+            createSwapchain(g_presenter.width, g_presenter.height);
+
+        // Wait for our own submission before freeing the command buffer: it must
+        // not be freed while the GPU may still be executing it.
+        vkWaitForFences(g_presenter.device, 1, &g_presenter.presentFence, VK_TRUE, 2000000000ULL);
+        vkResetFences(g_presenter.device, 1, &g_presenter.presentFence);
+        vkFreeCommandBuffers(g_presenter.device, g_presenter.cmdPool, 1, &cmdbuf);
+
+        g_presenter.framesPresented++;
+    }
+
     void presentLoop() {
         using namespace std::chrono_literals;
         while (g_presenter.running) {
             // Pop a source frame (non-blocking-ish, with a short timeout so the
             // loop can also service 'paused' and shutdown promptly).
             int waitMs = std::max(1, static_cast<int>(1000.0 / g_presenter.targetFps));
+
+            // FD mode: the framegen pipeline owns the destination image and we
+            // read it directly. Nothing is queued, so there is no AHB to pop and
+            // no CPU lock of an app-allocated buffer (see nativeImportDstFd).
+            if (g_presenter.dstReady && g_presenter.dstImage) {
+                presentFromFd();
+                continue;
+            }
+
             uintptr_t frame = lsfgdisplay::pop(waitMs);
             if (!frame) {
                 if (g_presenter.paused) std::this_thread::sleep_for(5ms);
@@ -902,13 +1072,53 @@ Java_com_lsfg_fork_wsi_WsiBridge_nativeStart(JNIEnv* env, jclass, jlong windowPt
         dqci.queueFamilyIndex = 0;
         dqci.queueCount = 1;
         dqci.pQueuePriorities = &priority;
-        const char* devExts[] = { "VK_KHR_swapchain", "VK_ANDROID_external_memory_android_hardware_buffer" };
+        // Extensions: swapchain + AHB import (the existing present path) plus
+        // VK_KHR_external_memory_fd, which the fd-based frame exchange needs in
+        // order to call vkGetMemoryFdPropertiesKHR when importing the framegen
+        // pipeline's destination image.
+        //
+        // Enabling only the first two meant volkLoadDevice() never populated
+        // vkGetMemoryFdPropertiesKHR, so the fd import called a NULL function
+        // pointer and died with SIGSEGV at fault addr 0x0. Enable it only when the
+        // physical device reports support, and let the import fail gracefully if
+        // it is unavailable (SessionManager then keeps the AHB pool).
+        // Two-call enumeration. The one-call form below was wrong: the first
+        // call overwrites `count` with the TOTAL number of properties, so resizing
+        // a 64-entry vector to that larger value appended default-initialised
+        // entries and, worse, the VK_INCOMPLETE result path cleared the list
+        // entirely. That reported every extension as absent (ahb=no) and the
+        // presenter silently lost the AHB extension it used to enable.
+        uint32_t extCount = 0;
+        if (vkEnumerateDeviceExtensionProperties(g_presenter.physdev, nullptr, &extCount, nullptr) != VK_SUCCESS || extCount == 0) {
+            WLOGE("cannot enumerate device extensions");
+            throw std::runtime_error("device extension enumeration failed");
+        }
+        std::vector<VkExtensionProperties> extProps(extCount);
+        if (vkEnumerateDeviceExtensionProperties(g_presenter.physdev, nullptr, &extCount, extProps.data()) != VK_SUCCESS)
+            throw std::runtime_error("device extension enumeration failed");
+        extProps.resize(extCount);
+        const auto hasExt = [&](const char* name) {
+            for (const auto& p : extProps)
+                if (std::strcmp(p.extensionName, name) == 0) return true;
+            return false;
+        };
+        std::vector<const char*> devExtList;
+        devExtList.push_back("VK_KHR_swapchain");
+        if (hasExt("VK_ANDROID_external_memory_android_hardware_buffer"))
+            devExtList.push_back("VK_ANDROID_external_memory_android_hardware_buffer");
+        g_presenter.hasMemoryFd = hasExt("VK_KHR_external_memory_fd");
+        if (g_presenter.hasMemoryFd)
+            devExtList.push_back("VK_KHR_external_memory_fd");
+        WLOG("device ext: external_memory_fd=%s ahb=%s",
+             g_presenter.hasMemoryFd ? "yes" : "no",
+             hasExt("VK_ANDROID_external_memory_android_hardware_buffer") ? "yes" : "no");
+
         VkDeviceCreateInfo dci{};
         dci.sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO;
         dci.queueCreateInfoCount = 1;
         dci.pQueueCreateInfos = &dqci;
-        dci.enabledExtensionCount = 2;
-        dci.ppEnabledExtensionNames = devExts;
+        dci.enabledExtensionCount = static_cast<uint32_t>(devExtList.size());
+        dci.ppEnabledExtensionNames = devExtList.data();
         VK_CHECK(vkCreateDevice(g_presenter.physdev, &dci, nullptr, &g_presenter.device));
         volkLoadDevice(g_presenter.device);
         vkGetDeviceQueue(g_presenter.device, 0, 0, &g_presenter.queue);
@@ -1005,6 +1215,138 @@ Java_com_lsfg_fork_wsi_WsiBridge_nativeFramesPresented(JNIEnv*, jclass) {
 }
 
 /**
+ * Import the framegen pipeline's exported destination image by fd, so frames can
+ * be presented WITHOUT copying them into an app-allocated AHardwareBuffer.
+ *
+ * That copy is what faults inside Adreno's internal copy helper (SIGSEGV/
+ * SEGV_MAPERR at a fixed small offset) on this GPU, and reading such a buffer
+ * requires a CPU lock that double-closes an fd under Mesa's fallback gralloc.
+ * Importing the pipeline's own memory sidesteps both.
+ *
+ * The image is created by us (same extent/format/usage the exporter used) and
+ * bound to the imported memory with VkImportMemoryFdInfoKHR. The pipeline keeps
+ * ownership of the memory; we own only this import.
+ *
+ * @param fd         Duplicated fd the caller opened (we do NOT close it)
+ * @param width,height Pipeline destination extent
+ * @return true on success
+ */
+JNIEXPORT jboolean JNICALL
+Java_com_lsfg_fork_wsi_WsiBridge_nativeImportDstFd(
+        JNIEnv*, jclass, jint fd, jint width, jint height) {
+    if (fd < 0 || width <= 0 || height <= 0) return JNI_FALSE;
+    if (!g_presenter.device) {
+        WLOGE("importDstFd: no device yet");
+        return JNI_FALSE;
+    }
+
+    // Replace any previous import.
+    if (g_presenter.dstImage) {
+        vkDestroyImage(g_presenter.device, g_presenter.dstImage, nullptr);
+        g_presenter.dstImage = VK_NULL_HANDLE;
+    }
+    if (g_presenter.dstMemory) {
+        vkFreeMemory(g_presenter.device, g_presenter.dstMemory, nullptr);
+        g_presenter.dstMemory = VK_NULL_HANDLE;
+    }
+    g_presenter.dstReady = false;
+
+    VkExternalMemoryImageCreateInfo ext{};
+    ext.sType = VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_IMAGE_CREATE_INFO;
+    ext.handleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT;
+
+    VkImageCreateInfo ici{};
+    ici.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
+    ici.pNext = &ext;
+    ici.imageType = VK_IMAGE_TYPE_2D;
+    // The pipeline's external images are R8G8B8A8 (BitDepth::R8G8B8A8).
+    ici.format = VK_FORMAT_R8G8B8A8_UNORM;
+    ici.extent = { static_cast<uint32_t>(width), static_cast<uint32_t>(height), 1 };
+    ici.mipLevels = 1;
+    ici.arrayLayers = 1;
+    ici.samples = VK_SAMPLE_COUNT_1_BIT;
+    ici.tiling = VK_IMAGE_TILING_OPTIMAL;
+    ici.usage = VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+    ici.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+    ici.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+
+    VkImage image = VK_NULL_HANDLE;
+    if (vkCreateImage(g_presenter.device, &ici, nullptr, &image) != VK_SUCCESS) {
+        WLOGE("importDstFd: vkCreateImage failed");
+        return JNI_FALSE;
+    }
+
+    // Guard: VK_KHR_external_memory_fd must be enabled or this is a NULL call.
+    if (!g_presenter.hasMemoryFd || !vkGetMemoryFdPropertiesKHR) {
+        WLOGE("importDstFd: VK_KHR_external_memory_fd not available");
+        vkDestroyImage(g_presenter.device, image, nullptr);
+        return JNI_FALSE;
+    }
+
+    VkMemoryFdPropertiesKHR fdProps{};
+    fdProps.sType = VK_STRUCTURE_TYPE_MEMORY_FD_PROPERTIES_KHR;
+    if (vkGetMemoryFdPropertiesKHR(g_presenter.device,
+            VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT, fd, &fdProps) != VK_SUCCESS) {
+        WLOGE("importDstFd: vkGetMemoryFdPropertiesKHR failed");
+        vkDestroyImage(g_presenter.device, image, nullptr);
+        return JNI_FALSE;
+    }
+
+    VkMemoryRequirements req{};
+    vkGetImageMemoryRequirements(g_presenter.device, image, &req);
+
+    uint32_t typeBits = req.memoryTypeBits & fdProps.memoryTypeBits;
+    if (!typeBits) {
+        WLOGE("importDstFd: no common memory type (img=0x%x fd=0x%x)",
+              req.memoryTypeBits, fdProps.memoryTypeBits);
+        vkDestroyImage(g_presenter.device, image, nullptr);
+        return JNI_FALSE;
+    }
+    uint32_t typeIndex = 0;
+    for (uint32_t i = 0; i < 64; ++i)
+        if (typeBits & (1u << i)) { typeIndex = i; break; }
+
+    VkImportMemoryFdInfoKHR importInfo{};
+    importInfo.sType = VK_STRUCTURE_TYPE_IMPORT_MEMORY_FD_INFO_KHR;
+    importInfo.handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT;
+    importInfo.fd = fd;
+
+    VkMemoryAllocateInfo mai{};
+    mai.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
+    mai.pNext = &importInfo;
+    mai.allocationSize = req.size;
+    mai.memoryTypeIndex = typeIndex;
+
+    VkDeviceMemory mem = VK_NULL_HANDLE;
+    VkResult r = vkAllocateMemory(g_presenter.device, &mai, nullptr, &mem);
+    if (r != VK_SUCCESS) {
+        WLOGE("importDstFd: vkAllocateMemory=%d", (int)r);
+        vkDestroyImage(g_presenter.device, image, nullptr);
+        return JNI_FALSE;
+    }
+    if (vkBindImageMemory(g_presenter.device, image, mem, 0) != VK_SUCCESS) {
+        WLOGE("importDstFd: bind failed");
+        vkFreeMemory(g_presenter.device, mem, nullptr);
+        vkDestroyImage(g_presenter.device, image, nullptr);
+        return JNI_FALSE;
+    }
+
+    g_presenter.dstImage = image;
+    g_presenter.dstMemory = mem;
+    g_presenter.dstWidth = static_cast<uint32_t>(width);
+    g_presenter.dstHeight = static_cast<uint32_t>(height);
+
+    // The pipeline keeps its destination in GENERAL and writes it every
+    // iteration, so declare that layout here and let the copy command read it as
+    // GENERAL. No per-frame transitions are needed on this image.
+    transitionToGeneral(image);
+
+    g_presenter.dstReady = true;
+    WLOG("imported pipeline dst fd (%dx%d)", width, height);
+    return JNI_TRUE;
+}
+
+/**
  * Fast CPU fill of a HardwareBuffer ring slot from a raw RGBA8888 byte source
  * (e.g. an ImageReader RGBA_8888 plane from a MediaProjection VirtualDisplay).
  * Copies row by row, respecting the source row stride.
@@ -1030,9 +1372,17 @@ Java_com_lsfg_fork_wsi_WsiBridge_nativeFillAhb(
     uint8_t* src = static_cast<uint8_t*>(env->GetPrimitiveArrayCritical(bytes, nullptr));
     if (src) {
         const uint32_t rowBytes = desc.width * 4; // RGBA8888 (4 bytes/pixel)
+        // AHardwareBuffer_Desc::stride is PIXELS per line for graphics formats,
+        // not bytes per line. The reference implementation multiplies by the
+        // bytes-per-pixel here (lsfg_render_loop.cpp: 'const uint32_t stride =
+        // desc.stride * 4u;'). Without the *4, every destination row advances
+        // by only `width` bytes while `rowBytes` bytes are written, so rows
+        // overwrite each other and the pattern degenerates into banding/garbage
+        // (matches glitch_cube.png: face colors collapse to a handful of pixels).
+        const size_t dstRowStrideBytes = static_cast<size_t>(desc.stride) * 4;
         uint8_t* d = static_cast<uint8_t*>(data);
         for (uint32_t y = 0; y < desc.height; ++y) {
-            std::memcpy(d + y * static_cast<size_t>(desc.stride),
+            std::memcpy(d + y * dstRowStrideBytes,
                         src + y * static_cast<size_t>(srcRowStride),
                         rowBytes);
         }

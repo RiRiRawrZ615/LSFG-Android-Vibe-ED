@@ -102,6 +102,8 @@ class SessionManager : ViewModel() {
     @Volatile private var capturedFrameIdx: Int = 0
     private val dstPool = java.util.ArrayList<HardwareBuffer>()
     @Volatile private var dstPoolIdx: Int = 0
+    // Cursor for the framegen session's own AHB-exported destination ring.
+    @Volatile private var ringSlotIdx: Int = 0
     @Volatile private var displayW: Int = 0
     @Volatile private var displayH: Int = 0
 
@@ -223,6 +225,7 @@ class SessionManager : ViewModel() {
         framegenSessionOk = false
         capturedFrameIdx = 0
         dstPoolIdx = 0
+        ringSlotIdx = 0
         dstPool.clear()
         if (!s.framegenBypass) {
             val dllPath = userDllPath?.takeIf { it.isNotBlank() } ?: extractShaderDll(appContext)
@@ -243,17 +246,54 @@ class SessionManager : ViewModel() {
             _state.update { it.copy(framegenReady = false) }
         }
 
-        // 3. Destination AHB pool for generated frames (presenter reads these).
-        val poolSize = 8
+        // 3. FD frame exchange: hand the presenter an openable fd for the
+        // pipeline's OWN destination image. This replaces the copy of each
+        // generated frame into an app-allocated HardwareBuffer, which faults
+        // inside Adreno's copy helper on this GPU (SIGSEGV at a fixed offset) and
+        // needs a CPU lock that double-closes an fd under Mesa's fallback
+        // gralloc. Set up only when the framegen session is live; otherwise the
+        // destination AHB pool below feeds the passthrough path.
+        var fdMode = false
+        if (framegenSessionOk) {
+            val dst = try { FramegenBridge.destinationFd() } catch (_: Throwable) { null }
+            if (dst != null) {
+                val (fd, dw, dh) = dst
+                try {
+                    fdMode = WsiBridge.importDstFd(fd, dw, dh)
+                    if (fdMode) {
+                        Log.i(TAG, "fd frame exchange armed: dst ${dw}x${dh} fd=$fd")
+                    } else {
+                        Log.w(TAG, "fd frame exchange import failed; falling back to AHB pool")
+                    }
+                } finally {
+                    // The presenter dup'd its own copy; this descriptor is ours.
+                    try { android.os.ParcelFileDescriptor.adoptFd(fd).close() } catch (_: Throwable) {}
+                }
+            } else {
+                Log.w(TAG, "framegen did not export a destination fd; using AHB pool")
+            }
+        }
+
+        // 3b. Destination AHB pool for generated frames (presenter reads these).
+        // Only needed when fd mode is unavailable (passthrough / export failed).
+        val poolSize = if (fdMode) 0 else 8
         repeat(poolSize) {
             dstPool.add(
                 HardwareBuffer.create(
                     w, h, PixelFormat.RGBA_8888, 1,
-                    // Destination AHBs for generated frames.  Cross-device
-                    // sharing (framegen writes, WSI reads) is handled at the
-                    // Vulkan memory-type level (vkGetAndroidHardwareBufferProperties
-                    // intersection), so the AHB usage flag stays GPU_SAMPLED_IMAGE.
-                    HardwareBuffer.USAGE_GPU_SAMPLED_IMAGE
+                    // Destination AHBs for generated frames: the framegen blit
+                    // (now a vkCmdCopyImage) WRITES the generated frame into these,
+                    // and the WSI presenter READS them back as a copy source.
+                    //
+                    // GPU_COLOR_OUTPUT is the gralloc usage that marks a buffer as
+                    // a GPU color target and gives it TRANSFER_DST/BLIT_DST capable
+                    // memory. Without it, the buffer is only allocated for
+                    // sampling, the destination image cannot legitimately be a copy
+                    // or blit target, and Adreno faults inside vkCmdBlitImage when
+                    // asked to write into it (SIGSEGV at fault addr 0x80).
+                    // GPU_SAMPLED_IMAGE is kept for the presenter's read side.
+                    HardwareBuffer.USAGE_GPU_SAMPLED_IMAGE or
+                            HardwareBuffer.USAGE_GPU_COLOR_OUTPUT
                 )
             )
         }
@@ -271,8 +311,14 @@ class SessionManager : ViewModel() {
             // Honest health check: the session is only "OK" if the presenter
             // has actually presented at least one frame (Vulkan path live).
             val presented = try { WsiBridge.framesPresented() } catch (_: Throwable) { 0L }
-            val healthy = presented > 0L && err == null
+            // Surface native frame-path failures instead of reporting a silent
+            // 0 fps forever. The native JNI calls cannot throw into Kotlin, so
+            // they stash the reason and we drain it here once per stats tick.
+            val feErr = try { FramegenBridge.lastError() } catch (_: Throwable) { null }
+            if (feErr != null) Log.e(TAG, "framegen error: $feErr")
+            val healthy = presented > 0L && err == null && feErr == null
             val status = if (err != null) err
+                else if (feErr != null) "framegen error: $feErr"
                 else if (presented == 0L) "running BUT presenter produced 0 frames (check logcat lsfg-wsi)"
                 else "running: ${s.captureMode} -> LSFG -> overlay"
             _state.update {
@@ -297,6 +343,14 @@ class SessionManager : ViewModel() {
             testThread = thread(name = "lsfg-testpattern", isDaemon = true) {
                 val intervalNs = 1_000_000_000L / 30
                 var ok = 0
+                // TELEMETRY FIX: this path never called onStats at all, so the
+                // Test tab was hard-wired to "0 fps" no matter what the pipeline
+                // did, and framesPresented() was never read. That made a working
+                // pipeline and a dead one look identical in the UI. Report the
+                // real numbers from here now.
+                var lastStatsNs = 0L
+                var srcSinceStats = 0
+                var lastPresented = 0L
                 while (_state.value.running) {
                     // keep producing while the session is live
                     if (!_state.value.running) break
@@ -315,6 +369,28 @@ class SessionManager : ViewModel() {
                         }
                     } catch (t: Throwable) {
                         Log.w(TAG, "testpattern frame failed: ${t.message}")
+                    }
+
+                    // Emit real stats once per second (source fps + presented).
+                    srcSinceStats++
+                    val nowNs = System.nanoTime()
+                    if (lastStatsNs == 0L) lastStatsNs = nowNs
+                    val dtNs = nowNs - lastStatsNs
+                    if (dtNs >= 1_000_000_000L) {
+                        val sourceFps = srcSinceStats * 1_000_000_000f / dtNs.toFloat()
+                        val presented = try { WsiBridge.framesPresented() } catch (_: Throwable) { 0L }
+                        // Report PRESENTED fps, not source fps. "fps > 0.5" is the
+                        // UI's green condition, so it must mean frames genuinely
+                        // reached vkQueuePresentKHR - otherwise the badge would go
+                        // green on a pipeline that produces nothing.
+                        val presentedFps = (presented - lastPresented) *
+                            1_000_000_000f / dtNs.toFloat()
+                        lastPresented = presented
+                        Log.i(TAG, "testpattern stats: source=%.1ffps presented=%d (%.1ffps) ok=%d"
+                            .format(sourceFps, presented, presentedFps, ok))
+                        onStats(presentedFps, 0f, null)
+                        srcSinceStats = 0
+                        lastStatsNs = nowNs
                     }
                     // Pace to ~30 fps.
                     val elapsed = System.nanoTime() - t0
@@ -522,12 +598,52 @@ class SessionManager : ViewModel() {
         // The slot must stay in [0,1]; the unbounded counter would eventually
         // write to a non-existent layer (native OOB -> the ~5s crash).
         val slot = (capturedFrameIdx % 2)
-        val m = if (multiplier < 1) 1 else multiplier
+        // INTERPOLATED frame count, not the display multiplier.
+        //
+        // The multiplier counts TOTAL frames shown per captured frame, so the
+        // captured frame itself is one of them and the pipeline only GENERATES
+        // (multiplier - 1). Both reference drivers do exactly this
+        // (lsfg-vk-cli: `imageCount = opts.multiplier - 1`), and their own fps
+        // formula `(imageCount + 1)` confirms the convention.
+        //
+        // We previously passed the raw multiplier, so dispatch() set total = m and
+        // the loop asked acquire() for m frames. The m-th acquire throws
+        // "No more frames to acquire", which then made the next dispatch() fail on
+        // a fence that was never signalled ("waitForFences: -3"), desynchronising
+        // the pipeline for the rest of the session.
+        val m = if (multiplier < 2) 1 else multiplier - 1
 
         FramegenBridge.writeSource(srcAhbPtr, slot)
         FramegenBridge.dispatch(m)
 
         var produced = 0
+
+        // Preferred: the framegen session owns a ring of its OWN destination
+        // images, exported as AHardwareBuffers. The pipeline copies each generated
+        // frame into the next ring slot, so the GPU never writes into an
+        // app-allocated HardwareBuffer, which is the operation that faults inside
+        // Adreno's copy helper (SIGSEGV at fault addr 0x80) through both
+        // vkCmdBlitImage and vkCmdCopyImage. The presenter reads these exactly the
+        // same way it reads the app pool, so the read side is unchanged.
+        val ringCount = FramegenBridge.ringCount()
+        if (ringCount > 0) {
+            if (capturedFrameIdx % 30 == 0) {
+                android.util.Log.i("lsfg-fork", "driveFramegen: mult=$multiplier m=$m ring=$ringCount slot=$slot idx=$capturedFrameIdx")
+            }
+            repeat(m) {
+                val ahbPtr = FramegenBridge.ringAhb(ringSlotIdx % ringCount)
+                if (ahbPtr == 0L) return@repeat
+                // acquireToDst still drives the pipeline; with a ring present it
+                // copies into the ring slot internally instead of the app AHB.
+                FramegenBridge.acquireToDst(ahbPtr)
+                WsiBridge.nativePushFrame(ahbPtr)
+                ringSlotIdx++
+                produced++
+            }
+            capturedFrameIdx++
+            return produced
+        }
+
         repeat(m) {
             val dst = dstPool[dstPoolIdx % dstPool.size]
             val dstPtr = WsiBridge.nativeAhbPtr(dst)

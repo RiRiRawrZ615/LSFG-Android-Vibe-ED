@@ -261,7 +261,21 @@ Context::Context(
     this->m_impl = std::make_unique<impl::Context>(impl::Context {
         .instance = std::ref(*instance.m_impl),
         .pipeline = std::move(pipeline),
-        .syncSemaphore = { vkhelper::createSemaphore(*vk.dld, *vk.device, true, true), 0 },
+        // The sync semaphore is created as a timeline semaphore, but NOT with an
+        // exported OPAQUE_FD handle.
+        //
+        // Requesting the opaque-fd export unconditionally made session creation
+        // fail outright on Mesa/Turnip with
+        //   vk::Device::createSemaphoreUnique: -1000072003
+        // which decodes to VK_ERROR_INVALID_EXTERNAL_HANDLE, throwing away an
+        // otherwise fully built pipeline (26 pipelines, 46 stages, 101 images).
+        //
+        // The export was only ever needed by Context::exportFds() on the desktop
+        // fd-sharing path. On Android this app exchanges frames through
+        // AHardwareBuffer imports plus its own blit fence, and drives the
+        // pipeline with the unsignaled (self-driven) mode, so an exportable
+        // semaphore buys nothing and only costs portability.
+        .syncSemaphore = { vkhelper::createSemaphore(*vk.dld, *vk.device, true, false), 0 },
         .internalSemaphores = { vkhelper::createSemaphore(*vk.dld, *vk.device, true), 0 },
         .fence = { vkhelper::createFence(*vk.dld, *vk.device), false }
     });
@@ -291,12 +305,63 @@ void Context::dispatch(uint32_t total, bool unsignaled) {
     auto& ctx{*this->m_impl};
     const auto& vk{ctx.instance.get().vk};
 
-    // Increment iteration counter after previous frame is completed
+    // Wait for the previous iteration to complete, then reset the fence.
+    //
+    // This wait is BOUNDED and TOLERATED, matching the reference layer
+    // (lsfg-vk-layer/src/wrapper.cpp: `const auto _ = waitForFences(..., 1s)`,
+    // result discarded, then resetFences).
+    //
+    // Our port previously waited with UINT64_MAX and THREW on any non-success.
+    // That is stricter than the reference and it converts ONE unresolved frame
+    // into a permanent failure: the throw escapes dispatch(), the iterator and
+    // semaphore counters keep the values they had mid-cycle, and every later
+    // iteration re-enters in the same broken state (observed on Adreno as a wall
+    // of identical `waitForFences: -3` immediately after the first cycle).
+    //
+    // -3 here is VK_ERROR_INITIALIZATION_FAILED, not VK_TIMEOUT (which is 2).
+    // It is reported rather than fatal, which is what lets the pipeline recover
+    // on the next iteration instead of wedging for the rest of the session.
     if (ctx.fence.second) {
-        const auto result{vk.device->waitForFences(*ctx.fence.first, true, UINT64_MAX, *vk.dld)};
-        if (result != vk::Result::eSuccess)
-            throw std::runtime_error("Unable to wait for completion of previous iteration");
-        vk.device->resetFences(*ctx.fence.first, *vk.dld);
+        // Raw dispatch-loader call, for the same reason as waitFenceRaw in
+        // lsfg_jni.cpp: the checked Vulkan-Hpp wrapper THROWS for -3 before the
+        // result reaches us, which made the tolerated branch below unreachable
+        // and turned every frame into a hard dispatch failure. Going through
+        // vk.dld->vkWaitForFences gives us the code itself.
+        const VkFence fenceHandle{static_cast<VkFence>(*ctx.fence.first)};
+        const VkDevice devHandle{static_cast<VkDevice>(*vk.device)};
+        const vk::Result result{static_cast<vk::Result>(
+            vk.dld->vkWaitForFences(
+                devHandle, 1, &fenceHandle, VK_TRUE, 1'000'000'000ULL))};
+        if (result == vk::Result::eSuccess) {
+            vk.device->resetFences(*ctx.fence.first, *vk.dld);
+        } else {
+            // The wait failed, so this fence is NOT in a usable state. Do not
+            // touch it further.
+            //
+            // vkResetFences on such a fence aborts inside the driver:
+            //   vkResetFences -> gsl_syncobj_destroy -> close(0) -> fdsan abort
+            // (confirmed on device, tombstone_08, dispatched from this exact
+            // line). -3 is VK_ERROR_INITIALIZATION_FAILED, i.e. the driver is
+            // telling us the fence handle is unusable, NOT that we timed out.
+            //
+            // Leaving it unreset just means the next cycle skips the wait, which
+            // is harmless: an unsignalled fence only ever gates the NEXT
+            // dispatch, and a failed wait already means the previous iteration is
+            // not going to complete. Resetting or recreating it re-enters the
+            // same crashing driver path, so we deliberately do neither.
+            if (ctx.instance.get().logCallback) {
+                ctx.instance.get().logCallback(
+                    std::string("dispatch: previous-iteration fence wait returned ") +
+                    std::to_string(static_cast<int>(result)) +
+                    " (" +
+                    (result == vk::Result::eTimeout ? "VK_TIMEOUT"
+                        : result == vk::Result::eErrorInitializationFailed
+                            ? "VK_ERROR_INITIALIZATION_FAILED"
+                            : "other") +
+                    "); fence left alone, continuing"
+                );
+            }
+        }
 
         ctx.fence.second = false;
     }
@@ -352,7 +417,15 @@ void Context::acquire(bool unsignaled) {
     const auto& vk{ctx.instance.get().vk};
 
     if (ctx.total == 0 || ctx.index >= ctx.total) {
-        throw std::runtime_error("No more frames to acquire");
+        // Report the actual counters, so a mismatch against the caller's loop is
+        // visible as numbers instead of inferred. The Kotlin driver decides its
+        // acquire count from the multiplier, so if these disagree the fault is on
+        // the caller's side of the boundary, not in the pipeline.
+        throw std::runtime_error(
+            "No more frames to acquire (index=" + std::to_string(ctx.index) +
+            " total=" + std::to_string(ctx.total) +
+            " iteration=" + std::to_string(ctx.iteration) + ")"
+        );
     }
 
     // Build transition command buffer to transition the timestamp

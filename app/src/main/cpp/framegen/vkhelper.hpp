@@ -149,8 +149,28 @@ namespace vkhelper {
         vk::Format format,
         uint32_t layers,
         vk::ImageUsageFlags usage,
-        bool external = false
+        bool external = false,
+        vk::ExternalMemoryHandleTypeFlagBits externalType
+            = vk::ExternalMemoryHandleTypeFlagBits::eOpaqueFd
     );
+
+#if defined(__ANDROID__)
+    ///
+    /// Query whether a given image configuration can be EXPORTED to an
+    /// AHardwareBuffer on this physical device.
+    ///
+    /// Guarding on this before allocating is what keeps a driver that cannot
+    /// export AHB memory from turning a supported configuration into a failed
+    /// session: the caller falls back to the opaque-fd handle type instead.
+    ///
+    bool supportsAhbExport(
+        const vk::detail::DispatchLoaderDynamic& dld,
+        const vk::PhysicalDevice& physdev,
+        vk::Extent2D extent,
+        vk::Format format,
+        vk::ImageUsageFlags usage
+    );
+#endif
 
 #if defined(__ANDROID__)
     ///
@@ -168,6 +188,28 @@ namespace vkhelper {
     /// @param buffer AHardwareBuffer to import
     ///
     vk::UniqueImage createImageFromAhb(
+        const vk::detail::DispatchLoaderDynamic& dld,
+        const vk::Device& device,
+        const void* buffer,
+        vk::ImageUsageFlags usage = vk::ImageUsageFlagBits::eTransferSrc | vk::ImageUsageFlagBits::eTransferDst
+    );
+
+    ///
+    /// Two-phase AHardwareBuffer import: returns the imported image AND the
+    /// device memory backing it.
+    ///
+    /// Use this whenever the image outlives the call. The raw-handle overload
+    /// above releases its allocation, so a caller that keeps using the returned
+    /// image would be using freed memory (vkFreeMemory on return), which traps
+    /// inside the Adreno driver. The caller must keep the returned memory alive
+    /// for as long as the image is referenced, and destroy the image first.
+    ///
+    /// @param dld Dynamic dispatch loader
+    /// @param device Vulkan device
+    /// @param buffer AHardwareBuffer to import
+    /// @param usage Image usage flags (must cover every later use of the image)
+    ///
+    std::pair<vk::UniqueImage, vk::UniqueDeviceMemory> createImageFromAhbAlloc(
         const vk::detail::DispatchLoaderDynamic& dld,
         const vk::Device& device,
         const void* buffer,
@@ -370,6 +412,46 @@ namespace vkhelper {
         const vk::Device& device,
         const vk::DeviceMemory& memory
     );
+
+    ///
+    /// Move an exported descriptor out of the range 0-2 if it landed there.
+    ///
+    /// Descriptors 0/1/2 are the process's std streams. Android's fdsan treats
+    /// closing a descriptor it does not expect us to own as a fatal abort:
+    ///
+    ///   Abort message: 'fdsan: attempted to close file descriptor 0, expected to
+    ///                   be unowned, actually owned by FileOutputStream ...'
+    ///
+    /// A driver is free to return a low descriptor number, so renumbering here
+    /// guarantees our own close() can never collide with the app's log writer.
+    ///
+    /// @return A descriptor >= 3, or -1 on failure
+    ///
+    int safeExportedFd(int fd);
+
+#if defined(__ANDROID__)
+    ///
+    /// Export a Vulkan memory allocation as an AHardwareBuffer.
+    ///
+    /// Android analogue of exportMemoryFd that actually works across VkDevices on
+    /// Adreno: an opaque fd exported by one device cannot be imported by another
+    /// (vkGetMemoryFdPropertiesKHR on the importing device reports memoryTypeBits
+    /// 0x0), but AHardwareBuffer handles are designed to be shared across devices
+    /// and processes. The memory must have been allocated with
+    /// VK_EXTERNAL_MEMORY_HANDLE_TYPE_ANDROID_HARDWARE_BUFFER_BIT_ANDROID in its
+    /// export info and must already be bound to a dedicated image.
+    ///
+    /// The returned buffer holds a NEW reference (per the extension spec) that the
+    /// caller owns and must release with AHardwareBuffer_release().
+    ///
+    /// @return AHardwareBuffer for the allocation, or nullptr on failure
+    ///
+    AHardwareBuffer* exportMemoryAhb(
+        const vk::detail::DispatchLoaderDynamic& dld,
+        const vk::Device& device,
+        const vk::DeviceMemory& memory
+    );
+#endif
 
     ///
     /// Export a Vulkan semaphore as a fd
